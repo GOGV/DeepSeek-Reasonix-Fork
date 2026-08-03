@@ -42,6 +42,15 @@
 
 <br/>
 
+## Fixed
+
+Fork patches on top of upstream `v1.19.3`:
+
+- [`78e1ac4`](https://github.com/GOGV/DeepSeek-Reasonix-Fork/commit/78e1ac4) (2026-08-03) — A missing or unreadable `system_prompt_file` no longer aborts startup; Reasonix warns and falls back to the inline/default system prompt.
+- [`9da8303`](https://github.com/GOGV/DeepSeek-Reasonix-Fork/commit/9da8303) (2026-08-03) — A relative `system_prompt_file` is now probed under the workspace root first (project override), then under the Reasonix home (global default); only when every location is missing does it fall back.
+- [`d0501e0`](https://github.com/GOGV/DeepSeek-Reasonix-Fork/commit/d0501e0) (2026-08-03) — When all probe locations miss, the warning names the configured value and lists every tried path ("not found at any of these locations: ...").
+- [`b3324cc`](https://github.com/GOGV/DeepSeek-Reasonix-Fork/commit/b3324cc) (2026-08-03) — Bash tool subprocesses now restore the OS account home as `HOME` when Reasonix itself runs with an overridden `HOME` (e.g. service launchers), so CLIs like `gh` / `arkcli` / `bl` find their credentials instead of reporting "not logged in".
+
 ## Features
 
 - **Config-driven.** Providers, the agent, enabled tools, and plugins are all
