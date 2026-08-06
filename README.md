@@ -59,6 +59,7 @@ Fork builds tag the upstream release with build metadata: `v<upstream>+fork.<bui
 
 Active fork patches on top of upstream `main-v2`:
 
+- [`2a03dff`](https://github.com/GOGV/DeepSeek-Reasonix-Fork/commit/2a03dff6) (2026-08-06) — `system_prompt_file` becomes two layers: the trusted user-level file forms the base prompt and the workspace-confined project-level file is appended after a header stating project rules win within the project (natural-language precedence, resolved by the model). User-level missing warns and falls back; project-level missing skips silently; containment/permission errors stay fatal. Hard guardrails (permissions deny/ask, OS sandbox, forbid_read/network) live in config and are untouched.
 - [`b481b07`](https://github.com/GOGV/DeepSeek-Reasonix-Fork/commit/b481b07a) (2026-08-04) — Provider credentials now fall back to `$HOME/.env` and then the OS account home's `.env` when the Reasonix-home `.env` is missing (e.g. `REASONIX_HOME` pointing elsewhere or a launcher overriding `HOME`), fixing `missing env X_API_KEY` / HTTP 401 in those deployments. Precedence: Reasonix credentials file > process env > `$HOME/.env` > account home `.env`; project `./.env` is still never imported. (upstream [PR #7354](https://github.com/esengine/DeepSeek-Reasonix/pull/7354))
 
 Retired or merged upstream — no longer carried by this fork:
