@@ -55,6 +55,8 @@
 
 Upstream syncs land on `fork-dev` **commit by commit** (`git merge <c>` for each upstream commit in order), never as one batch merge. Conflicts are resolved per commit with the same rule: changes already adopted upstream yield to the upstream implementation; fork-unique changes are kept. This keeps every upstream change attributable and the project's evolution readable, at the cost of more work per sync.
 
+Fork builds tag the upstream release with build metadata: `v<upstream>+fork.<build-date>.<active-fix-count>` (e.g. `v1.20.0+fork.2026.08.06.2`).
+
 Active fork patches on top of upstream `main-v2`:
 
 - [`b3324cc`](https://github.com/GOGV/DeepSeek-Reasonix-Fork/commit/b3324cc) (2026-08-03) — Bash tool subprocesses now restore the OS account home as `HOME` when Reasonix itself runs with an overridden `HOME` (e.g. service launchers), so CLIs like `gh` / `arkcli` / `bl` find their credentials instead of reporting "not logged in". (upstream [issue #7331](https://github.com/esengine/DeepSeek-Reasonix/issues/7331))
