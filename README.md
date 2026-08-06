@@ -59,10 +59,11 @@ Fork builds tag the upstream release with build metadata: `v<upstream>+fork.<bui
 
 Active fork patches on top of upstream `main-v2`:
 
-- [`b3324cc`](https://github.com/GOGV/DeepSeek-Reasonix-Fork/commit/b3324cc) (2026-08-03) — Bash tool subprocesses now restore the OS account home as `HOME` when Reasonix itself runs with an overridden `HOME` (e.g. service launchers), so CLIs like `gh` / `arkcli` / `bl` find their credentials instead of reporting "not logged in". (upstream [issue #7331](https://github.com/esengine/DeepSeek-Reasonix/issues/7331))
 - [`b481b07`](https://github.com/GOGV/DeepSeek-Reasonix-Fork/commit/b481b07a) (2026-08-04) — Provider credentials now fall back to `$HOME/.env` and then the OS account home's `.env` when the Reasonix-home `.env` is missing (e.g. `REASONIX_HOME` pointing elsewhere or a launcher overriding `HOME`), fixing `missing env X_API_KEY` / HTTP 401 in those deployments. Precedence: Reasonix credentials file > process env > `$HOME/.env` > account home `.env`; project `./.env` is still never imported. (upstream [PR #7354](https://github.com/esengine/DeepSeek-Reasonix/pull/7354))
 
-Merged upstream — no longer carried by this fork:
+Retired or merged upstream — no longer carried by this fork:
+
+- ~~[`b3324cc`](https://github.com/GOGV/DeepSeek-Reasonix-Fork/commit/b3324cc) (2026-08-03) — Bash tool subprocesses now restore the OS account home as `HOME` when Reasonix itself runs with an overridden `HOME`.~~ → retired 2026-08-06: deployment aligned to the upstream-recommended pattern (real `HOME` + `REASONIX_HOME` for Reasonix state), making this unnecessary. Upstream declined the idea in [issue #7331](https://github.com/esengine/DeepSeek-Reasonix/issues/7331) (not planned).
 
 - ~~[`78e1ac4`](https://github.com/GOGV/DeepSeek-Reasonix-Fork/commit/78e1ac4) (2026-08-03) — A missing or unreadable `system_prompt_file` no longer aborts startup; Reasonix warns and falls back to the inline/default system prompt.~~ → upstream [`2f16450e`](https://github.com/esengine/DeepSeek-Reasonix/commit/2f16450e399d2fc0bd6f6bb8bb9ecc858f2e124f)
 - ~~[`9da8303`](https://github.com/GOGV/DeepSeek-Reasonix-Fork/commit/9da8303) (2026-08-03) — A relative `system_prompt_file` is now probed under the workspace root first (project override), then under the Reasonix home (global default); only when every location is missing does it fall back.~~ → upstream [`2f16450e`](https://github.com/esengine/DeepSeek-Reasonix/commit/2f16450e399d2fc0bd6f6bb8bb9ecc858f2e124f)
