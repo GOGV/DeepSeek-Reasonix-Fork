@@ -96,6 +96,21 @@ reasonix config currency USD
 在交互式会话中，`/currency` 显示已保存值和最终解析结果；
 `/currency auto|CNY|USD` 会修改偏好并刷新当前运行时，同时保留当前对话。
 
+### 配置自动压缩阈值
+
+桌面端与 CLI 共用用户全局的自动压缩阈值。可以查看当前生效值及来源、修改全局默认值，
+或为当前项目添加覆盖：
+
+```sh
+reasonix config compact-ratio              # 查看生效值及来源
+reasonix config compact-ratio 75           # 设置用户全局默认值
+reasonix config compact-ratio --local 75   # 写入 ./reasonix.toml 项目覆盖
+```
+
+可设置范围为 65–85%，内置默认值为 80%。数值越低越早压缩，可能降低 prompt prefix
+缓存复用率；数值越高则会在压缩前保留更多上下文。项目 `reasonix.toml` 的优先级高于
+用户全局配置。修改会应用于新启动的 CLI 会话；已经运行的会话继续使用启动时加载的阈值。
+
 ## 一次性运行与自动化
 
 脚本只需要最终回答时，使用 `-p` / `--print`：
@@ -112,6 +127,19 @@ echo "解释这段代码" | reasonix run
 `--model`、`--profile`、`--max-steps`、`--effort`、`--dir`、`--add-dir`、
 `--continue`、`--resume PATH`、`--copy`、`--allowed-tools` 和
 `--permission-mode`，以及作为 `--permission-mode auto` 别名的 `--auto` / `-y`。
+
+### 基准对照组
+
+`--ablate` 用于整体关闭某个子系统，让基准测试能把成功率的变化归因到它身上。取值是
+`evidence`、`planner`、`subagent`、`retrieval`、`compaction` 的逗号分隔组合，另外还接受
+`none`（默认，全部启用）和 `all`。子代理继承父代理的对照组配置，对照组名称会写入
+`--metrics` 文件，因此记录下来的每次运行都能自证跑的是哪一组。
+
+```sh
+reasonix run --ablate evidence,planner --metrics run.json "修复失败的测试"
+```
+
+这是测量工具，不是调优开关：关掉某个子系统只会让 Reasonix 在它本来负责的工作上变差。
 
 ### 输出格式
 
@@ -184,6 +212,9 @@ reasonix session status <machine-session-id> --json [--dir SESSION_DIR | --proje
 reasonix session recovery [<machine-session-id>] --json [--dir SESSION_DIR | --project-root PATH]
 reasonix task list --json [--dir SESSION_DIR | --project-root PATH] [--session MACHINE_SESSION_ID]
 reasonix task show <task-id> --json [--dir SESSION_DIR | --project-root PATH] [--session MACHINE_SESSION_ID]
+reasonix task monitor list --json [--dir PROJECT_DIR]
+reasonix task monitor status <task-id> --json [--dir PROJECT_DIR]
+reasonix task monitor events <task-id> --json|--jsonl [--dir PROJECT_DIR] [--after N] [--follow]
 reasonix hook list --json [--project-root PATH] [--home-dir PATH]
 reasonix hook status --json [--project-root PATH] [--home-dir PATH]
 ```
@@ -334,14 +365,17 @@ SSH 下远端进程无法读取本机剪贴板，请使用终端粘贴快捷键�
 | `/verbose` | 切换详细 reasoning 显示。 |
 | `/sandbox` | 查看沙盒状态。 |
 | `/goal` | 启动、查看或清除长周期 Goal。 |
+| `/docs [问题]` | 显示内置语料身份，或先本地检索，再让当前配置的 AI 根据版本匹配证据回答。 |
+| `/reasonix:docs [问题]` | 当已有自定义命令或兼容插件/Skill 别名占用 `/docs` 时优先使用的内置后备入口；若这个名称也已被占用，菜单会选择下一个空闲的 `reasonix:` 限定名，不覆盖原命令。 |
 | `/mcp`、`/skills`、`/hooks` | 查看和管理扩展。 |
 | `/remember <note>` | 把常驻 note 追加到项目指令文档；`# <note>` 是快捷方式。 |
 | `/memory [subcommand]` | 查看指令、记忆 provenance、召回、revision 与恢复。 |
 | `/rewind` | 把对话和/或代码恢复到更早的 turn。 |
 | `/tree`、`/branch`、`/switch` | 查看或切换会话分支。 |
+| `/reload` | 重载 agent 运行时（扩展、工具、skills、commands、hooks、providers），保留当前会话。回合运行中只排队一次；失败原子——重建失败时当前运行时不受影响。 |
 
 切换模型、effort 或工作模式会重建运行时，同时保留当前对话、会话级权限覆盖、附加目录
-访问权限和 session ownership。
+访问权限和 session ownership。`/reload` 使用同一套失败原子重建语义。
 
 ### 记忆诊断与恢复
 
@@ -358,6 +392,7 @@ SSH 下远端进程无法读取本机剪贴板，请使用终端粘贴快捷键�
 | `/memory archived` | 列出 archive facts 及其受管路径。 |
 | `/memory recover <archive-path>` | 不覆盖 active data，把 archive 恢复为新 revision。 |
 
-这些命令始终作用于当前 session controller。Remote Workbench 使用远程 memory catalog，
-绝不回退读取桌面本机记忆。权限、自动召回、写入确认和迁移行为见
+这些命令始终作用于当前 session controller。当会话位于远端主机上（`reasonix remote
+connect` 或桌面的远程网页窗口）时，它们使用远程 memory catalog，绝不回退读取桌面本机
+记忆。权限、自动召回、写入确认和迁移行为见
 [Context Engine v2](./SESSION_MEMORY_RETRIEVAL.zh-CN.md)。

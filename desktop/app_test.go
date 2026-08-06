@@ -24,6 +24,7 @@ import (
 	"reasonix/internal/billing"
 	"reasonix/internal/boot"
 	"reasonix/internal/bot"
+	"reasonix/internal/command"
 	"reasonix/internal/config"
 	"reasonix/internal/control"
 	"reasonix/internal/event"
@@ -372,14 +373,139 @@ func (r *desktopAskRuntimeRunner) Run(ctx context.Context, _ string) error {
 	return r.ask(ctx)
 }
 
-func TestCommandsIncludesEffortNotThinking(t *testing.T) {
+func TestCommandsIncludesDocsAndEffortNotThinking(t *testing.T) {
 	app := NewApp()
 	cmds := app.Commands()
+	if !hasCommand(cmds, "docs") {
+		t.Fatalf("Commands() should include docs: %+v", cmds)
+	}
 	if !hasCommand(cmds, "effort") {
 		t.Fatalf("Commands() should include effort: %+v", cmds)
 	}
 	if hasCommand(cmds, "thinking") {
 		t.Fatalf("Commands() should not include thinking: %+v", cmds)
+	}
+}
+
+func TestCommandsDocsShowsOnlyRuntimeWinner(t *testing.T) {
+	tests := []struct {
+		name     string
+		commands []command.Command
+		skills   []skill.Skill
+		wantKind string
+	}{
+		{
+			name:     "custom command shadows builtin",
+			commands: []command.Command{{Name: "docs", Description: "custom docs"}},
+			wantKind: "custom",
+		},
+		{
+			name:     "skill shadows builtin",
+			skills:   []skill.Skill{{Name: "docs", Description: "docs skill"}},
+			wantKind: "skill",
+		},
+		{
+			name:     "custom command shadows skill and builtin",
+			commands: []command.Command{{Name: "docs", Description: "custom docs"}},
+			skills:   []skill.Skill{{Name: "docs", Description: "docs skill"}},
+			wantKind: "custom",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctrl := control.New(control.Options{Commands: tt.commands, Skills: tt.skills})
+			defer ctrl.Close()
+			app := NewApp()
+			app.setTestCtrl(ctrl, "")
+
+			var docs []CommandInfo
+			for _, cmd := range app.Commands() {
+				if cmd.Name == "docs" {
+					docs = append(docs, cmd)
+				}
+			}
+			if len(docs) != 1 || docs[0].Kind != tt.wantKind {
+				t.Fatalf("docs commands = %+v, want one %s entry", docs, tt.wantKind)
+			}
+			if fallback, ok := commandInfoByName(app.Commands(), control.ReasonixDocsSlashName); !ok || fallback.Kind != "builtin" {
+				t.Fatalf("qualified docs fallback = %+v, %v; want built-in", fallback, ok)
+			}
+		})
+	}
+}
+
+func commandInfoByName(commands []CommandInfo, name string) (CommandInfo, bool) {
+	for _, command := range commands {
+		if command.Name == name {
+			return command, true
+		}
+	}
+	return CommandInfo{}, false
+}
+
+func TestCommandsDocsAccountsForHiddenCompatibilityAliases(t *testing.T) {
+	tests := []struct {
+		name          string
+		commands      []command.Command
+		skills        []skill.Skill
+		wantCanonical string
+	}{
+		{
+			name: "hidden plugin command alias",
+			commands: []command.Command{
+				{Name: "docs", Plugin: "manuals", Hidden: true},
+				{Name: "manuals:docs", Plugin: "manuals"},
+			},
+			wantCanonical: "manuals:docs",
+		},
+		{
+			name:          "compatible plugin skill alias",
+			skills:        []skill.Skill{{Name: "docs", Plugin: "manuals"}},
+			wantCanonical: "manuals:docs",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctrl := control.New(control.Options{Commands: tt.commands, Skills: tt.skills})
+			defer ctrl.Close()
+			app := NewApp()
+			app.setTestCtrl(ctrl, "")
+			commands := app.Commands()
+			if _, ok := commandInfoByName(commands, "docs"); ok {
+				t.Fatalf("hidden runtime owner left a misleading docs entry: %+v", commands)
+			}
+			for _, want := range []string{control.ReasonixDocsSlashName, tt.wantCanonical} {
+				if _, ok := commandInfoByName(commands, want); !ok {
+					t.Fatalf("commands missing %q: %+v", want, commands)
+				}
+			}
+		})
+	}
+}
+
+func TestCommandsDocsDoesNotDisplaceQualifiedCustomCommands(t *testing.T) {
+	ctrl := control.New(control.Options{Commands: []command.Command{
+		{Name: "docs", Description: "custom docs"},
+		{Name: "reasonix:docs", Description: "qualified custom docs"},
+		{Name: "reasonix:builtin:docs", Description: "second qualified custom docs"},
+	}})
+	defer ctrl.Close()
+	app := NewApp()
+	app.setTestCtrl(ctrl, "")
+	commands := app.Commands()
+	for _, want := range []struct {
+		name string
+		kind string
+	}{
+		{name: "docs", kind: "custom"},
+		{name: "reasonix:docs", kind: "custom"},
+		{name: "reasonix:builtin:docs", kind: "custom"},
+		{name: "reasonix:builtin:docs:2", kind: "builtin"},
+	} {
+		if command, ok := commandInfoByName(commands, want.name); !ok || command.Kind != want.kind {
+			t.Fatalf("command %q = %+v, %v; want kind %q", want.name, command, ok, want.kind)
+		}
 	}
 }
 
@@ -996,6 +1122,9 @@ status_bar_items = ["cost", "balance"]
 	if err := userCfg.SetDesktopAppearance("dark", "graphite"); err != nil {
 		t.Fatalf("set desktop appearance: %v", err)
 	}
+	if err := userCfg.SetDesktopTerminalTheme("light"); err != nil {
+		t.Fatalf("set desktop terminal theme: %v", err)
+	}
 	if err := userCfg.SetDesktopCloseBehavior("background"); err != nil {
 		t.Fatalf("set desktop close behavior: %v", err)
 	}
@@ -1016,7 +1145,7 @@ status_bar_items = ["cost", "balance"]
 	}
 
 	got := NewApp().Settings()
-	if got.DesktopLanguage != "en" || got.DesktopLayoutStyle != "classic" || got.DesktopTheme != "dark" || got.DesktopThemeStyle != "graphite" || got.CloseBehavior != "background" || got.StatusBarStyle != "text" {
+	if got.DesktopLanguage != "en" || got.DesktopLayoutStyle != "classic" || got.DesktopTheme != "dark" || got.DesktopThemeStyle != "graphite" || got.DesktopTerminalTheme != "light" || got.CloseBehavior != "background" || got.StatusBarStyle != "text" {
 		t.Fatalf("desktop settings = lang:%q layout:%q theme:%q style:%q close:%q status:%q, want user-level desktop prefs", got.DesktopLanguage, got.DesktopLayoutStyle, got.DesktopTheme, got.DesktopThemeStyle, got.CloseBehavior, got.StatusBarStyle)
 	}
 	if want := []string{"model", "balance", "cache"}; !reflect.DeepEqual(got.StatusBarItems, want) {
@@ -1036,6 +1165,9 @@ func TestDesktopStartupSettingsUsesUserDesktopPreferencesWithoutFullSettingsPayl
 	}
 	if err := userCfg.SetDesktopAppearance("dark", "graphite"); err != nil {
 		t.Fatalf("set desktop appearance: %v", err)
+	}
+	if err := userCfg.SetDesktopTerminalTheme("light"); err != nil {
+		t.Fatalf("set desktop terminal theme: %v", err)
 	}
 	if err := userCfg.SetDesktopStatusBarStyle("icon"); err != nil {
 		t.Fatalf("set desktop status bar style: %v", err)
@@ -1057,7 +1189,7 @@ func TestDesktopStartupSettingsUsesUserDesktopPreferencesWithoutFullSettingsPayl
 	}
 
 	got := NewApp().DesktopStartupSettings()
-	if got.DesktopLanguage != "en" || got.DesktopLayoutStyle != "classic" || got.DesktopTheme != "dark" || got.DesktopThemeStyle != "graphite" || got.DisplayMode != "standard" || got.StatusBarStyle != "icon" || got.CheckUpdates || got.UpdateChannel != "stable" {
+	if got.DesktopLanguage != "en" || got.DesktopLayoutStyle != "classic" || got.DesktopTheme != "dark" || got.DesktopThemeStyle != "graphite" || got.DesktopTerminalTheme != "light" || got.DisplayMode != "standard" || got.StatusBarStyle != "icon" || got.CheckUpdates || got.UpdateChannel != "stable" {
 		t.Fatalf("DesktopStartupSettings desktop prefs = %+v, want user-level startup prefs", got)
 	}
 	if want := []string{"workspace", "git_branch", "model"}; !reflect.DeepEqual(got.StatusBarItems, want) {
@@ -7026,7 +7158,7 @@ func TestSubmitEntryPointsRejectEmptyProviderInput(t *testing.T) {
 			return app.SubmitEditedDisplayToTab("missing", "visible prompt", "\n", "original prompt")
 		}},
 		{name: "initial goal", call: func() error {
-			_, err := app.SubmitInitialGoalToTab("missing", "goal", "visible prompt", "", nil, "normal", "auto", "local", 0, 0)
+			_, err := app.SubmitInitialGoalToTab("missing", "goal", "visible prompt", "", nil, "normal", "auto")
 			return err
 		}},
 	} {

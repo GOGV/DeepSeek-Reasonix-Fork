@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -10,6 +11,7 @@ import (
 	"reasonix/internal/evidence"
 	"reasonix/internal/jobs"
 	"reasonix/internal/provider"
+	"reasonix/internal/tool"
 )
 
 // runLoopState holds per-Run loop counters and flags. It is package-private and
@@ -20,14 +22,13 @@ type runLoopState struct {
 	runMaxStepsKey    string
 	runLimitHostOwned bool
 
-	finalReadinessBlocks int
-	seenReadinessStates  map[string]struct{}
-	emptyFinalBlocks     int
-	handoffNudges        int
-	usedAnyTool          bool
-	streamRecoveries     int
-	graceRound           bool
-	recoveryGraceRound   bool
+	emptyFinalBlocks   int
+	handoffNudges      int
+	usedAnyTool        bool
+	streamRecoveries   int
+	goalToolRepairs    int
+	graceRound         bool
+	recoveryGraceRound bool
 
 	todoProgress         int
 	trackingTodoProgress bool
@@ -42,6 +43,92 @@ type runLoopState struct {
 	workDurationMs func() int64
 }
 
+// streamedTurn is one provider completion collected by stream. Keeping the
+// result together makes the missing-reasoning recovery path explicit: the
+// first, malformed completion is never committed before a safe replacement is
+// available, and a failed recovery can still fall back to the complete first
+// response without re-running any tool.
+type streamedTurn struct {
+	text               string
+	reasoning          string
+	signature          string
+	reasoningID        string
+	reasoningStatus    string
+	calls              []provider.ToolCall
+	responsesItems     []json.RawMessage
+	usage              *provider.Usage
+	interrupted        bool
+	partialToolStarted bool
+	partialCalls       []provider.ToolCall
+	err                error
+}
+
+// deferredStreamSink keeps selected stream events local until the caller
+// chooses which provider response to adopt. On an ordinary healthy DeepSeek
+// turn, reasoning arrives before tool calls and unlocks live tool-card events.
+// On the rare malformed turn with no reasoning, only the speculative partial
+// tool cards remain buffered, so retrying does not flash duplicate cards in the
+// UI. A recovery attempt buffers everything because it may be discarded.
+type deferredStreamSink struct {
+	inner               event.Sink
+	deferAll            bool
+	waitingForReasoning bool
+	sawReasoning        bool
+	events              []event.Event
+}
+
+func newReasoningAwareStreamSink(inner event.Sink) *deferredStreamSink {
+	return &deferredStreamSink{inner: inner, waitingForReasoning: true}
+}
+
+func newDeferredStreamSink(inner event.Sink) *deferredStreamSink {
+	return &deferredStreamSink{inner: inner, deferAll: true}
+}
+
+func (s *deferredStreamSink) Emit(e event.Event) {
+	if s == nil {
+		return
+	}
+	if s.deferAll {
+		s.events = append(s.events, e)
+		return
+	}
+	if s.waitingForReasoning && e.Kind == event.Reasoning && strings.TrimSpace(e.Text) != "" {
+		s.sawReasoning = true
+		s.inner.Emit(e)
+		s.flushBuffered()
+		return
+	}
+	if s.waitingForReasoning && !s.sawReasoning && e.Kind == event.ToolDispatch {
+		s.events = append(s.events, e)
+		return
+	}
+	s.inner.Emit(e)
+}
+
+func (s *deferredStreamSink) flushBuffered() {
+	if s == nil {
+		return
+	}
+	for _, e := range s.events {
+		s.inner.Emit(e)
+	}
+	s.events = nil
+}
+
+func (s *deferredStreamSink) Flush() {
+	if s == nil {
+		return
+	}
+	s.flushBuffered()
+}
+
+func (s *deferredStreamSink) Discard() {
+	if s != nil {
+		s.events = nil
+	}
+}
+
 // beginRunTurn handles evidence scope, delivery classification, background-job
 // evidence re-lease, and the initial user-turn persistence. Callers still own
 // all Run-level defers (workspace lease, evidence commit, delivery checkpoint,
@@ -51,6 +138,10 @@ func (a *Agent) beginRunTurn(ctx context.Context, input string) (rawInput string
 	providerInput := input
 	scope, scoped := DeliveryExecutionScopeFromContext(ctx)
 	preserveEvidence := a.preserveEvidenceOnce
+	// A run that starts with a pending readiness recovery (or an explicit
+	// evidence-preserving continuation) and then passes readiness counts as a
+	// recovery in the final audit.
+	a.readinessRecovered = preserveEvidence || a.deliveryRecoveryPending
 	if a.evidence != nil {
 		switch {
 		case preserveEvidence:
@@ -114,8 +205,10 @@ func (a *Agent) beginRunTurn(ctx context.Context, input string) (rawInput string
 	} else if strings.TrimSpace(classifierInput) == "" {
 		classifierInput = rawInput
 	}
-	a.deliveryTaskExpected = deliveryTaskNeedsEvidence(classifierInput)
-	a.deliveryMutationExpected = deliveryTaskNeedsMutation(classifierInput) && registryHasWriterTools(a.tools)
+	intent := classifyDeliveryTaskIntent(classifierInput)
+	a.deliveryTaskExpected = intent == deliveryIntentObservableRead || intent == deliveryIntentMutation || intent == deliveryIntentPersistentAction
+	a.deliveryMutationExpected = intent == deliveryIntentMutation && registryHasWriterTools(a.tools)
+	a.deliveryPersistentExpected = deliveryTaskNeedsPersistentAction(classifierInput)
 	a.recoveryTaskSummary = boundedRecoveryTaskSummary(classifierInput)
 	// A cancelled/error turn leaves a provider-excluded recovery record at the
 	// transcript tail. Fold its bounded facts into this new user turn exactly
@@ -156,18 +249,16 @@ func (a *Agent) beginRunTurn(ctx context.Context, input string) (rawInput string
 	})
 
 	state = &runLoopState{
-		finalReadinessBlocks: 0,
-		seenReadinessStates:  make(map[string]struct{}),
-		emptyFinalBlocks:     0,
-		handoffNudges:        0,
-		usedAnyTool:          false,
-		streamRecoveries:     0,
-		graceRound:           false,
-		recoveryGraceRound:   false,
-		todoStallRounds:      0,
-		seenTodoProgress:     make(map[string]struct{}),
-		executorHandoff:      a.executorHandoffGuard && strings.Contains(input, executorHandoffMarker),
-		input:                input,
+		emptyFinalBlocks:   0,
+		handoffNudges:      0,
+		usedAnyTool:        false,
+		streamRecoveries:   0,
+		graceRound:         false,
+		recoveryGraceRound: false,
+		todoStallRounds:    0,
+		seenTodoProgress:   make(map[string]struct{}),
+		executorHandoff:    a.executorHandoffGuard && strings.Contains(input, executorHandoffMarker),
+		input:              input,
 	}
 	state.todoProgress, state.trackingTodoProgress = a.canonicalTodoProgress()
 	if a.evidence != nil {
@@ -197,8 +288,15 @@ func (a *Agent) runToolLoop(ctx context.Context, state *runLoopState) error {
 			prevPrefixShape = prefixShape
 		}
 
-		text, reasoning, signature, calls, usage, interrupted, partialToolStarted, partialCalls, err := a.stream(ctx, step+1)
+		streamed := a.streamWithMissingReasoningRecovery(ctx, step+1)
+		text, reasoning, signature, calls, responsesItems, usage := streamed.text, streamed.reasoning, streamed.signature, streamed.calls, streamed.responsesItems, streamed.usage
+		interrupted, partialToolStarted, partialCalls, err := streamed.interrupted, streamed.partialToolStarted, streamed.partialCalls, streamed.err
+		cacheDiagnostics := CompareShape(prevPrefixShape, prefixShape, usage)
 		if err != nil {
+			a.emitTurnUsage(usage, &cacheDiagnostics)
+			if msg, ok := finishReasonMessage(usage); ok {
+				a.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelWarn, Text: msg})
+			}
 			if interrupted && state.streamRecoveries < maxStreamRecoveries {
 				state.streamRecoveries++
 				a.recordInterruptedDisplay(text, reasoning, partialCalls, false, state.workDurationMs())
@@ -214,15 +312,9 @@ func (a *Agent) runToolLoop(ctx context.Context, state *runLoopState) error {
 			return err
 		}
 		state.streamRecoveries = 0
-		cacheDiagnostics := CompareShape(prevPrefixShape, prefixShape, usage)
 		a.lastPrefixShape = prefixShape
 		a.haveLastPrefixShape = true
-		if usage != nil && usage.TotalTokens > 0 {
-			a.sink.Emit(event.Event{Kind: event.Usage, Usage: usage, Pricing: a.pricing,
-				UsageSource:      a.usageSource,
-				CacheDiagnostics: &cacheDiagnostics,
-				SessionHit:       int(a.sessCacheHit.Load()), SessionMiss: int(a.sessCacheMiss.Load())})
-		}
+		a.emitTurnUsage(usage, &cacheDiagnostics)
 		if msg, ok := finishReasonMessage(usage); ok {
 			a.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelWarn, Text: msg})
 		}
@@ -231,13 +323,15 @@ func (a *Agent) runToolLoop(ctx context.Context, state *runLoopState) error {
 		// archive. Most OpenAI-compatible backends do not replay it; providers
 		// with an explicit round-trip contract retain the raw provider text.
 		calls = a.withPreviewFileDiffs(calls)
-		a.warnMissingToolCallReasoning(calls, reasoning)
 		a.session.Add(provider.Message{
 			Role:               provider.RoleAssistant,
 			Content:            text,
 			ReasoningContent:   reasoning,
 			ReasoningSignature: signature,
+			ReasoningID:        streamed.reasoningID,
+			ReasoningStatus:    streamed.reasoningStatus,
 			ToolCalls:          calls,
+			ResponsesItems:     responsesItems,
 			WorkDurationMs:     state.workDurationMs(),
 		})
 
@@ -249,7 +343,7 @@ func (a *Agent) runToolLoop(ctx context.Context, state *runLoopState) error {
 			continue
 		}
 
-		cont, terr := a.handleToolRound(ctx, state, step, calls, usage)
+		cont, terr := a.handleToolRound(ctx, state, step, text, reasoning, calls, usage)
 		if !cont {
 			return terr
 		}
@@ -258,6 +352,145 @@ func (a *Agent) runToolLoop(ctx context.Context, state *runLoopState) error {
 	// is already in the session, so the user can just send another message to pick
 	// up where it left off.
 	return &maxStepsPause{steps: state.runMaxSteps, key: state.runMaxStepsKey}
+}
+
+// streamWithMissingReasoningRecovery silently repairs an isolated DeepSeek
+// thinking-mode tool-call response that omitted reasoning_content. It replays
+// the exact same provider request at most once, before any tool is executed and
+// without injecting a synthetic prompt. A configuration-scoped cooldown keeps
+// a gateway that persistently strips reasoning from doubling every request; the
+// existing explicit-empty reasoning_content wire fallback remains the final
+// compatibility path.
+func (a *Agent) streamWithMissingReasoningRecovery(ctx context.Context, turn int) streamedTurn {
+	var streamSink *deferredStreamSink
+	attemptSink := a.sink
+	if provider.WarnOnMissingToolCallReasoning(a.prov) {
+		streamSink = newReasoningAwareStreamSink(a.sink)
+		attemptSink = streamSink
+	}
+	first := a.streamTurn(ctx, turn, attemptSink)
+	if first.err != nil {
+		streamSink.Flush()
+		return first
+	}
+
+	missing, shouldRetry := a.observeMissingToolCallReasoning(first.calls, first.reasoning)
+	if !missing {
+		streamSink.Flush()
+		return first
+	}
+	event.RecordProtocolRecovery(a.sink, event.ProtocolRecoveryAudit{Kind: event.ProtocolRecoveryMissingReasoningDetected})
+
+	// Non-empty visible output was already streamed from the first response.
+	// Replaying it would duplicate user-visible text, so keep the structurally
+	// valid empty-key fallback and let the cooldown suppress repeated attempts.
+	if !shouldRetry || strings.TrimSpace(first.text) != "" {
+		streamSink.Flush()
+		event.RecordProtocolRecovery(a.sink, event.ProtocolRecoveryAudit{Kind: event.ProtocolRecoveryMissingReasoningRetrySuppressed})
+		event.RecordProtocolRecovery(a.sink, event.ProtocolRecoveryAudit{Kind: event.ProtocolRecoveryMissingReasoningFallback})
+		return first
+	}
+
+	event.RecordProtocolRecovery(a.sink, event.ProtocolRecoveryAudit{Kind: event.ProtocolRecoveryMissingReasoningRetryAttempted})
+	retrySink := newDeferredStreamSink(a.sink)
+	retry := a.streamTurn(ctx, turn, retrySink)
+	if retry.err != nil {
+		retrySink.Discard()
+		if ctx.Err() != nil {
+			streamSink.Discard()
+			// The recovery stream was intentionally invisible, so do not persist
+			// partial retry text/reasoning as though the user had already seen it.
+			return streamedTurn{usage: mergeStreamUsage(first.usage, retry.usage), err: retry.err}
+		}
+		streamSink.Flush()
+		first.usage = mergeStreamUsage(first.usage, retry.usage)
+		if first.usage != nil {
+			a.lastUsage.Store(first.usage)
+		}
+		event.RecordProtocolRecovery(a.sink, event.ProtocolRecoveryAudit{Kind: event.ProtocolRecoveryMissingReasoningFallback})
+		return first
+	}
+
+	streamSink.Discard()
+	retrySink.Flush()
+	retry.usage = mergeStreamUsage(first.usage, retry.usage)
+	if retry.usage != nil {
+		a.lastUsage.Store(retry.usage)
+	}
+	retryMissing, _ := a.observeMissingToolCallReasoning(retry.calls, retry.reasoning)
+	if retryMissing {
+		event.RecordProtocolRecovery(a.sink, event.ProtocolRecoveryAudit{Kind: event.ProtocolRecoveryMissingReasoningDetected})
+		event.RecordProtocolRecovery(a.sink, event.ProtocolRecoveryAudit{Kind: event.ProtocolRecoveryMissingReasoningFallback})
+	} else if len(retry.calls) == 0 {
+		// An exact replay can legitimately choose a different completion shape.
+		// Adopt it wholesale because no tool from the discarded response ran, but
+		// do not misreport the disappearance of tool calls as recovered reasoning.
+		event.RecordProtocolRecovery(a.sink, event.ProtocolRecoveryAudit{Kind: event.ProtocolRecoveryMissingReasoningRetryReplaced})
+	} else {
+		event.RecordProtocolRecovery(a.sink, event.ProtocolRecoveryAudit{Kind: event.ProtocolRecoveryMissingReasoningRetryRecovered})
+	}
+	return retry
+}
+
+func (a *Agent) streamTurn(ctx context.Context, turn int, sink event.Sink) streamedTurn {
+	text, reasoning, signature, reasoningID, reasoningStatus, calls, responsesItems, usage, interrupted, partialToolStarted, partialCalls, err := a.stream(ctx, turn, sink)
+	return streamedTurn{
+		text: text, reasoning: reasoning, signature: signature,
+		reasoningID: reasoningID, reasoningStatus: reasoningStatus,
+		calls: calls, responsesItems: responsesItems, usage: usage,
+		interrupted: interrupted, partialToolStarted: partialToolStarted, partialCalls: partialCalls, err: err,
+	}
+}
+
+func mergeStreamUsage(first, retry *provider.Usage) *provider.Usage {
+	if first == nil && retry == nil {
+		return nil
+	}
+	if first == nil {
+		merged := *retry
+		// The first provider request still happened even if its terminal usage
+		// chunk was lost. Preserve the retry's known tokens and count both calls.
+		merged.RequestCount = 1 + usageRequestCount(retry)
+		return &merged
+	}
+	if retry == nil {
+		merged := *first
+		// Likewise, a failed recovery request without usage is still an API call.
+		merged.RequestCount = usageRequestCount(first) + 1
+		return &merged
+	}
+	merged := *retry
+	merged.PromptTokens += first.PromptTokens
+	merged.CompletionTokens += first.CompletionTokens
+	merged.TotalTokens += first.TotalTokens
+	merged.CacheHitTokens += first.CacheHitTokens
+	merged.CacheMissTokens += first.CacheMissTokens
+	merged.ReasoningTokens += first.ReasoningTokens
+	merged.RequestCount = usageRequestCount(first) + usageRequestCount(retry)
+	return &merged
+}
+
+func usageRequestCount(usage *provider.Usage) int {
+	if usage == nil {
+		return 0
+	}
+	if usage.RequestCount > 0 {
+		return usage.RequestCount
+	}
+	return 1
+}
+
+func (a *Agent) emitTurnUsage(usage *provider.Usage, cacheDiagnostics *CacheDiagnostics) {
+	if usage == nil || (usage.TotalTokens <= 0 && usage.RequestCount <= 0) {
+		return
+	}
+	if usage.TotalTokens > 0 {
+		a.lastUsage.Store(usage)
+	}
+	a.sink.Emit(event.Event{Kind: event.Usage, ModelRef: a.modelRef, Usage: usage, Pricing: a.pricing,
+		UsageSource:      a.usageSource,
+		CacheDiagnostics: cacheDiagnostics,
+		SessionHit:       int(a.sessCacheHit.Load()), SessionMiss: int(a.sessCacheMiss.Load())})
 }
 
 // handleFinalResponse processes a no-tool assistant turn: recovery pause,
@@ -279,36 +512,20 @@ func (a *Agent) handleFinalResponse(ctx context.Context, state *runLoopState, te
 			StopReason: reason,
 		}
 	}
-	finalizeTask := !a.deliveryScopeActive || deliveryDisposition(text) == deliveryGoalFinal
-	readiness := a.finalReadinessCheckFor(finalizeTask)
+	readiness := a.finalReadinessCheckFor()
 	if state.graceRound && (readiness.reason != "" || !hasVisibleFinalAnswer(text)) {
 		a.maybeCompact(ctx, usage)
 		return false, &maxStepsPause{steps: state.runMaxSteps, key: state.runMaxStepsKey}
 	}
 	if readiness.reason != "" {
-		// Extend the base retry budget only when the missing-requirement
-		// state actually changes. Counting ledger length let repeated reads,
-		// failed bookkeeping, or other irrelevant receipts masquerade as
-		// convergence and burn through six expensive model calls.
-		sig := readiness.progressSignature()
-		_, repeatedState := state.seenReadinessStates[sig]
-		progressed := state.finalReadinessBlocks > 0 && !repeatedState
-		state.seenReadinessStates[sig] = struct{}{}
-		state.finalReadinessBlocks++
-		exhausted := state.finalReadinessBlocks >= maxFinalReadinessBlocksWithProgress ||
-			(state.finalReadinessBlocks >= maxFinalReadinessBlocks && !progressed)
-		result := evidence.ReadinessBlocked
-		if exhausted {
-			result = evidence.ReadinessErrored
-			event.RecordReadinessAudit(a.sink, readiness.audit(result, false))
-			a.deliveryRecoveryPending = true
-			return false, &FinalReadinessError{Attempts: state.finalReadinessBlocks, Reason: readiness.reason, Missing: readiness.missingIDs()}
-		}
-		event.RecordReadinessAudit(a.sink, readiness.audit(result, false))
-		a.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelInfo, Code: event.NoticeCodeFinalReadiness, Text: finalReadinessNoticeText(), Detail: readiness.reason})
-		a.session.Add(provider.Message{Role: provider.RoleUser, Content: a.withTurnPreferences(finalReadinessRetryMessageFor(readiness))})
-		a.maybeCompact(ctx, usage)
-		return true, nil
+		// Delivery no longer retries readiness with hidden model messages: the
+		// run ends immediately with the missing requirements, and the host owns
+		// what happens next. In Goal mode the FSM auto-continues under budget
+		// with the missing list as the next turn; plain Delivery turns surface
+		// the recovery card for an explicit user continuation.
+		event.RecordReadinessAudit(a.sink, readiness.audit(evidence.ReadinessErrored, false))
+		a.deliveryRecoveryPending = true
+		return false, &FinalReadinessError{Attempts: 1, Reason: readiness.reason, Missing: readiness.missingIDs()}
 	}
 	if !hasVisibleFinalAnswer(text) {
 		// DeepSeek thinking mode can stream a long reasoning_content and
@@ -338,7 +555,7 @@ func (a *Agent) handleFinalResponse(ctx context.Context, state *runLoopState, te
 		return true, nil
 	}
 	if readiness.applies {
-		event.RecordReadinessAudit(a.sink, readiness.audit(evidence.ReadinessAllowed, state.finalReadinessBlocks > 0))
+		event.RecordReadinessAudit(a.sink, readiness.audit(evidence.ReadinessAllowed, a.readinessRecovered))
 	}
 	if !a.closeSteerIntakeIfIdle() {
 		return true, nil
@@ -354,9 +571,10 @@ func (a *Agent) handleFinalResponse(ctx context.Context, state *runLoopState, te
 // cancellation, todo stall tracking, recovery finalization pause, and the
 // max-steps grace round. cont=true continues the tool loop; cont=false returns
 // err from Run.
-func (a *Agent) handleToolRound(ctx context.Context, state *runLoopState, step int, calls []provider.ToolCall, usage *provider.Usage) (cont bool, err error) {
+func (a *Agent) handleToolRound(ctx context.Context, state *runLoopState, step int, text, reasoning string, calls []provider.ToolCall, usage *provider.Usage) (cont bool, err error) {
 	state.emptyFinalBlocks = 0
 	state.usedAnyTool = true
+	outOfContextGoalOnly := toolCallsAreOutOfContextGoalReports(ctx, calls)
 
 	// Grace round guard: if we already gave the model one extra response
 	// and it still wants to call tools, stop here.
@@ -408,6 +626,18 @@ func (a *Agent) handleToolRound(ctx context.Context, state *runLoopState, step i
 	if ctx.Err() != nil {
 		a.recordInterruptedDisplay("", "", nil, true, state.workDurationMs())
 		return false, ctx.Err()
+	}
+	if outOfContextGoalOnly {
+		if hasVisibleFinalAnswer(text) {
+			// Keep the assistant tool call and host error paired in the transcript,
+			// but accept the co-streamed answer instead of spending another model
+			// request repairing harmless Goal bookkeeping outside Goal mode.
+			return a.handleFinalResponse(ctx, state, text, reasoning, usage)
+		}
+		state.goalToolRepairs++
+		if state.goalToolRepairs > 1 {
+			return false, fmt.Errorf("model repeatedly called update_goal outside Goal mode without a visible answer")
+		}
 	}
 	if !a.planMode.Load() {
 		nextProgress, nextTracking := a.canonicalTodoProgress()
@@ -478,4 +708,19 @@ func (a *Agent) handleToolRound(ctx context.Context, state *runLoopState, step i
 		a.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelInfo, Code: event.NoticeCodeToolBudget, Text: toolBudgetNoticeText(), Detail: fmt.Sprintf("budget (%s=%d) exhausted: one grace round to finalize", state.runMaxStepsKey, state.runMaxSteps)})
 	}
 	return true, nil
+}
+
+func toolCallsAreOutOfContextGoalReports(ctx context.Context, calls []provider.ToolCall) bool {
+	if len(calls) == 0 {
+		return false
+	}
+	if _, ok := tool.GoalTurnRecorderFromContext(ctx); ok {
+		return false
+	}
+	for _, call := range calls {
+		if call.Name != "update_goal" {
+			return false
+		}
+	}
+	return true
 }

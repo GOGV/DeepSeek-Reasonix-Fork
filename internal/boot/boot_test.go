@@ -1418,6 +1418,43 @@ func TestNewProviderAppliesOfficialKimiK3RequestContract(t *testing.T) {
 	}
 }
 
+func TestNewProviderPropagatesConfiguredMaxOutputTokens(t *testing.T) {
+	var gotReq map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&gotReq); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n"))
+	}))
+	defer srv.Close()
+
+	p, err := NewProvider(&config.ProviderEntry{
+		Name: "openai", Kind: "openai", BaseURL: "https://api.openai.com/v1",
+		ChatURL: srv.URL, Model: "o3", MaxOutputTokens: 4096,
+	})
+	if err != nil {
+		t.Fatalf("NewProvider: %v", err)
+	}
+	ch, err := p.Stream(context.Background(), provider.Request{
+		Messages: []provider.Message{{Role: provider.RoleUser, Content: "hi"}},
+	})
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	for chunk := range ch {
+		if chunk.Type == provider.ChunkError {
+			t.Fatalf("stream error: %v", chunk.Err)
+		}
+	}
+	if gotReq["max_completion_tokens"] != float64(4096) {
+		t.Fatalf("max_completion_tokens = %#v, want 4096: %+v", gotReq["max_completion_tokens"], gotReq)
+	}
+	if _, exists := gotReq["max_tokens"]; exists {
+		t.Fatalf("official OpenAI request must omit max_tokens: %+v", gotReq)
+	}
+}
+
 func TestNewProviderAppliesModelReasoningProtocol(t *testing.T) {
 	var gotReq map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2149,6 +2186,7 @@ func defaultFullBootToolNames() []string {
 		"complete_step",
 		"delete_range",
 		"delete_symbol",
+		"docs",
 		"edit_file",
 		"explore",
 		"fleet",
@@ -2175,6 +2213,7 @@ func defaultFullBootToolNames() []string {
 		"read_only_task",
 		"read_session",
 		"read_skill",
+		"read_subagent_result",
 		"remember",
 		"research",
 		"review",
@@ -2183,6 +2222,7 @@ func defaultFullBootToolNames() []string {
 		"slash_command",
 		"task",
 		"todo_write",
+		"update_goal",
 		"wait",
 		"web_fetch",
 		"write_file",
@@ -2198,6 +2238,7 @@ func economyBootToolNames() []string {
 		"edit_file",
 		"kill_shell",
 		"read_file",
+		"update_goal",
 		"wait",
 		"write_file",
 	}
@@ -2249,6 +2290,7 @@ command = "reasonix-missing-mockmcp"
 		"edit_file",
 		"kill_shell",
 		"read_file",
+		"update_goal",
 		"wait",
 		"write_file",
 	}
@@ -2265,7 +2307,7 @@ command = "reasonix-missing-mockmcp"
 		"explore", "research", "review", "security_review",
 		"lsp_definition", "lsp_references", "lsp_hover", "lsp_diagnostics",
 		"code_index", "complete_step", "glob", "grep", "ls", "move_file", "multi_edit", "todo_write",
-		"history", "list_sessions", "read_session", "memory", "remember", "forget", "slash_command",
+		"docs", "history", "list_sessions", "read_session", "memory", "remember", "forget", "slash_command",
 	} {
 		if requestHasTool(req, forbidden) {
 			t.Fatalf("economy first request should hide %q; tools=%v", forbidden, toolSchemaNames(req.Tools))
@@ -2291,6 +2333,7 @@ func TestBuildTokenEconomyConnectsOptionalSourcesOnDemand(t *testing.T) {
 		{source: "search", tools: []string{"code_index", "glob", "grep", "ls"}},
 		{source: "files", tools: []string{"delete_range", "delete_symbol", "move_file", "multi_edit", "notebook_edit"}},
 		{source: "workflow", tools: []string{"complete_step", "todo_write"}},
+		{source: "docs", tools: []string{"docs"}},
 		{source: "sessions", tools: []string{"history", "list_sessions", "read_session"}},
 		{source: "memory", tools: []string{"forget", "memory", "remember"}},
 		{source: "commands", tools: []string{"slash_command"}},
