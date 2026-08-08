@@ -3626,7 +3626,7 @@ func toEventShellExecution(in *tool.ShellExecution, durationMs int64) *event.She
 		SupportsAndAnd: in.SupportsAndAnd,
 		State:          in.State,
 		FailurePhase:   in.FailurePhase,
-		StderrTail:     in.StderrTail,
+		OutputTail:     in.OutputTail,
 		MutationRisk:   in.MutationRisk,
 		Verification:   in.Verification,
 		DurationMs:     in.DurationMs,
@@ -3653,7 +3653,7 @@ func toProviderToolExecution(in *tool.ShellExecution) *provider.ToolExecution {
 		SupportsAndAnd: in.SupportsAndAnd,
 		State:          in.State,
 		FailurePhase:   in.FailurePhase,
-		StderrTail:     in.StderrTail,
+		OutputTail:     in.OutputTail,
 		MutationRisk:   in.MutationRisk,
 		Verification:   in.Verification,
 		DurationMs:     in.DurationMs,
@@ -3673,7 +3673,9 @@ func batchCallIsMutatingFailure(a *Agent, call provider.ToolCall, o toolOutcome)
 		return false
 	}
 	readOnly := false
-	if t, _, ambiguous := a.tools.ResolveCall(call.Name); t != nil && len(ambiguous) == 0 {
+	t, _, ambiguous := a.tools.ResolveCall(call.Name)
+	known := t != nil && len(ambiguous) == 0
+	if known {
 		readOnly = t.ReadOnly()
 	}
 	if call.ResolvedReadOnly != nil {
@@ -3695,7 +3697,16 @@ func batchCallIsMutatingFailure(a *Agent, call provider.ToolCall, o toolOutcome)
 	if o.resolved && !o.resolvedReadOnly {
 		return true
 	}
-	return evidence.ToolCallMutates(call.Name, json.RawMessage(call.Arguments), readOnly) || !readOnly
+	if evidence.ToolCallMutates(call.Name, json.RawMessage(call.Arguments), readOnly) {
+		return true
+	}
+	// Fail closed only for a target the host could not classify at all. A blanket
+	// !readOnly fallback here would re-admit exactly the writers ToolCallMutates
+	// deliberately exempts (todo_write, complete_step, ask, bash_output, wait and
+	// the other non-mutation meta tools): a failed todo update would then block
+	// every real edit left in the batch. Resolved writer proxies already returned
+	// true above, so narrowing this does not reopen the use_capability path.
+	return !known
 }
 
 // batchCallStaticallySkippable reports whether a remaining call can be marked
