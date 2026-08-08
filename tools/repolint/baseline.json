@@ -2,12 +2,12 @@
   "limits": {
     "banner": 312,
     "commented-code": 0,
-    "essay": 4099,
-    "file-size": 73680,
+    "essay": 4114,
+    "file-size": 73759,
     "layering": 1,
     "marker": 0,
     "narrative": 66,
-    "test-file-size": 64649
+    "test-file-size": 64805
   },
   "files": {
     "cmd/e2ebench/main.go": {
@@ -667,7 +667,7 @@
     },
     "internal/cli/chat_tui.go": {
       "essay": 111,
-      "file-size": 4590
+      "file-size": 4576
     },
     "internal/cli/chat_tui_paste.go": {
       "essay": 9
@@ -682,7 +682,7 @@
     },
     "internal/cli/cli.go": {
       "essay": 60,
-      "file-size": 2008
+      "file-size": 2007
     },
     "internal/cli/cli_test.go": {
       "essay": 9,
@@ -803,6 +803,9 @@
     "internal/cli/transcript.go": {
       "essay": 1,
       "file-size": 2
+    },
+    "internal/cli/tui_diagnostics.go": {
+      "essay": 3
     },
     "internal/cli/upgrade.go": {
       "essay": 2
@@ -1417,7 +1420,7 @@
     },
     "internal/provider/responses/responses.go": {
       "essay": 26,
-      "file-size": 81
+      "file-size": 80
     },
     "internal/provider/responses/responses_test.go": {
       "essay": 6,
@@ -1513,8 +1516,8 @@
       "essay": 4
     },
     "internal/repair/update.go": {
-      "essay": 35,
-      "file-size": 2618,
+      "essay": 45,
+      "file-size": 2713,
       "narrative": 2
     },
     "internal/repair/update_handoff_darwin_smoke_test.go": {
@@ -1530,7 +1533,8 @@
       "essay": 1
     },
     "internal/repair/update_test.go": {
-      "test-file-size": 2793
+      "essay": 2,
+      "test-file-size": 2949
     },
     "internal/sandbox/sandbox.go": {
       "essay": 11
