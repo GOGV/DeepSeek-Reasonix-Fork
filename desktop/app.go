@@ -835,12 +835,7 @@ func (a *App) restoreOrBuildTabs() {
 			}
 			tab.model = entry.Model
 			tab.effort = cloneStringPtr(entry.Effort)
-			// Prefer agentPreset; fall back to legacy tokenMode for one version.
-			if strings.TrimSpace(entry.AgentPreset) != "" {
-				tab.tokenMode = boot.TokenModeFromAgentPreset(entry.AgentPreset)
-			} else {
-				tab.tokenMode = boot.NormalizeTokenMode(entry.TokenMode)
-			}
+			tab.tokenMode = boot.NormalizeTokenMode(entry.TokenMode)
 			tab.mode = persistedTabMode(entry.Mode)
 			// Validate the persisted goal against the session's goal-state
 			// sidecar: a typed /new or /clear rotates the session through the
@@ -2289,9 +2284,63 @@ func messagesHaveConversationContent(messages []provider.Message) bool {
 	return false
 }
 
-func (a *App) clearActiveSessionRuntime(tab *WorkspaceTab, oldCtrl control.SessionAPI) (SessionClearResult, error) {
+// ClearSession discards the current conversation and rotates to a fresh unsaved one.
+func (a *App) ClearSession() error {
+	return a.ClearSessionForTab("")
+}
+
+// ClearSessionForTab clears the requested tab regardless of later focus changes.
+func (a *App) ClearSessionForTab(tabID string) error {
+	tab, ctrl := a.tabAndCtrlByID(tabID)
+	if a.tabIsReadOnly(tab) {
+		return readOnlyChannelErr()
+	}
+	if ctrl == nil {
+		return a.workspaceNotReadyErr(tab)
+	}
+	if err := a.ensureTabControllerWorkspace(tab); err != nil {
+		return err
+	}
+	ctrl = a.controllerForTab(tab)
+	if ctrl == nil {
+		return a.workspaceNotReadyErr(tab)
+	}
+	if controllerHasActiveRuntimeWork(ctrl) {
+		return a.clearActiveSessionRuntime(tab, ctrl)
+	}
+	if err := ctrl.ClearSession(); err != nil {
+		return err
+	}
+	if err := a.ensureTabSessionLeaseForRebuild(tab, ctrl.SessionPath(), ""); err != nil {
+		// Wails bridge return: a raw lease error would carry the session path
+		// and holder id across to the frontend.
+		return userFacingSessionLeaseError("", err)
+	}
+	tab.resetTelemetry(ctrl.SessionPath())
+	// Mirror the controller: ClearSession cleared the active goal.
+	a.clearTabGoal(tab)
+	a.persistTabSessionPath(tab, ctrl.SessionPath())
+	a.invalidatePromptHistoryCache()
+	return nil
+}
+
+// clearTabGoal drops the tab's persisted goal copy so rebuilds and restarts
+// cannot re-seed a goal the controller has already cleared on session rotation.
+func (a *App) clearTabGoal(tab *WorkspaceTab) {
+	if tab == nil {
+		return
+	}
+	a.mu.Lock()
+	tab.goal = ""
+	if current := a.tabs[tab.ID]; current == tab {
+		a.saveTabsLocked()
+	}
+	a.mu.Unlock()
+}
+
+func (a *App) clearActiveSessionRuntime(tab *WorkspaceTab, oldCtrl control.SessionAPI) error {
 	if tab == nil || oldCtrl == nil {
-		return SessionClearResult{}, fmt.Errorf("workspace is still starting")
+		return fmt.Errorf("workspace is still starting")
 	}
 	// This is a build+swap of the tab's controller; serialize with the other
 	// rebuild paths (see runtimeRebuildMu) so a concurrent model/effort/settings
@@ -2323,7 +2372,7 @@ func (a *App) clearActiveSessionRuntime(tab *WorkspaceTab, oldCtrl control.Sessi
 	if oldCtrl.RuntimeStatus().Cancellable {
 		oldCtrl.Cancel()
 		if err := waitControllerStopped(oldCtrl); err != nil {
-			return SessionClearResult{}, err
+			return err
 		}
 	}
 	destroy := oldCtrl.BeginDestroySession(oldPath)
@@ -2331,22 +2380,21 @@ func (a *App) clearActiveSessionRuntime(tab *WorkspaceTab, oldCtrl control.Sessi
 	teardownTimedOut := waitDestroyHandles(destroys)
 	if teardownTimedOut {
 		if err := agent.MarkCleanupPending(oldPath, "clear"); err != nil {
-			return SessionClearResult{}, err
+			return err
 		}
 	}
 
 	newSink := &tabEventSink{tabID: tab.ID, app: a, ctx: a.ctx}
 	sharedHost := a.lookupSharedHost(snap.sharedHostKey)
 	newCtrl, err := boot.Build(a.bootContext(), boot.Options{
-		Model:                    snap.model,
-		RequireKey:               false,
-		AutoPricingCurrency:      a.desktopAutoPricingCurrency(),
-		StatsSource:              "desktop",
+		Model:               snap.model,
+		RequireKey:          false,
+		AutoPricingCurrency: a.desktopAutoPricingCurrency(),
+		StatsSource:         "desktop", OnConfigLoadWarnings: a.configLoadWarningsHandler(),
 		Sink:                     newSink,
 		WorkspaceRoot:            snap.workspaceRoot,
 		SessionDir:               sessionDirForSnapshot(snap),
 		EffortOverride:           cloneStringPtr(snap.effort),
-		AgentPreset:              boot.NormalizeAgentPreset(snap.currentTokenMode()),
 		TokenMode:                snap.currentTokenMode(),
 		SharedHost:               sharedHost,
 		CleanupPendingReconciler: reconcileDesktopCleanupPending,
@@ -2366,7 +2414,7 @@ func (a *App) clearActiveSessionRuntime(tab *WorkspaceTab, oldCtrl control.Sessi
 			oldSink.setBinding(tab.ID, nil)
 			oldSink.setContext(a.ctx)
 		}
-		return SessionClearResult{}, err
+		return err
 	}
 	if teardownTimedOut {
 		go delayedDesktopSessionCleanup(oldPath, destroys)
@@ -2374,7 +2422,7 @@ func (a *App) clearActiveSessionRuntime(tab *WorkspaceTab, oldCtrl control.Sessi
 		if err := removeDesktopSessionArtifacts(oldPath); err != nil {
 			finishDestroyHandles(destroys)
 			newCtrl.Close()
-			return SessionClearResult{}, err
+			return err
 		}
 		finishDestroyHandles(destroys)
 	}
@@ -2392,7 +2440,7 @@ func (a *App) clearActiveSessionRuntime(tab *WorkspaceTab, oldCtrl control.Sessi
 		newCtrl.Close()
 		// Surfaces through ClearSession's Wails return; keep the holder's
 		// path/pid/writer id out of it.
-		return SessionClearResult{}, userFacingSessionLeaseError("", err)
+		return userFacingSessionLeaseError("", err)
 	}
 	newCtrl.SetFreshSessionPath(path)
 
@@ -2406,7 +2454,7 @@ func (a *App) clearActiveSessionRuntime(tab *WorkspaceTab, oldCtrl control.Sessi
 		tab.releaseSessionLease()
 		oldCtrl.CloseAfterDestroy()
 		a.emitProjectTreeChangedForSessionDirs(newCtrl.SessionDir())
-		return SessionClearResult{}, fmt.Errorf("tab %q changed while clearing the session", tab.ID)
+		return fmt.Errorf("tab %q changed while clearing the session", tab.ID)
 	}
 	tab.Ctrl = newCtrl
 	tab.sink = newSink
@@ -2428,7 +2476,7 @@ func (a *App) clearActiveSessionRuntime(tab *WorkspaceTab, oldCtrl control.Sessi
 	oldCtrl.CloseAfterDestroy()
 	a.emitProjectTreeChangedForSessionDirs(newCtrl.SessionDir())
 	a.notifyTabRuntimeRebuilt(tab)
-	return a.bumpAndSnapshotSessionClear(tab), nil
+	return nil
 }
 
 func removeDesktopSessionArtifacts(path string) error {
@@ -4458,15 +4506,14 @@ func (a *App) buildSessionRebindCandidate(
 		ownsSharedHostRef = true
 	}
 	ctrl, err := boot.Build(a.bootContext(), boot.Options{
-		Model:                    model,
-		RequireKey:               false,
-		AutoPricingCurrency:      a.desktopAutoPricingCurrency(),
-		StatsSource:              "desktop",
+		Model:               model,
+		RequireKey:          false,
+		AutoPricingCurrency: a.desktopAutoPricingCurrency(),
+		StatsSource:         "desktop", OnConfigLoadWarnings: a.configLoadWarningsHandler(),
 		Sink:                     a.desktopControllerSink(sink, cfg.Notifications),
 		WorkspaceRoot:            root,
 		SessionDir:               sessionDir,
 		EffortOverride:           cloneStringPtr(source.effort),
-		AgentPreset:              boot.NormalizeAgentPreset(runtimeProfile.tokenMode),
 		TokenMode:                runtimeProfile.tokenMode,
 		SharedHost:               sharedHost,
 		CleanupPendingReconciler: reconcileDesktopCleanupPending,
@@ -6776,12 +6823,9 @@ type Meta struct {
 	CollaborationMode string             `json:"collaborationMode"`
 	ToolApprovalMode  string             `json:"toolApprovalMode"`
 	TokenMode         string             `json:"tokenMode"`
-	// AgentPreset is the canonical role setting (light|balanced|delivery).
-	// TokenMode remains the dual-write legacy wire value for one version.
-	AgentPreset string           `json:"agentPreset,omitempty"`
-	Goal        string           `json:"goal,omitempty"`
-	GoalStatus  string           `json:"goalStatus,omitempty"`
-	GoalRuntime *GoalRuntimeView `json:"goalRuntime,omitempty"`
+	Goal              string             `json:"goal,omitempty"`
+	GoalStatus        string             `json:"goalStatus,omitempty"`
+	GoalRuntime       *GoalRuntimeView   `json:"goalRuntime,omitempty"`
 	// Nil means no authoritative snapshot; non-nil empty means clear the panel.
 	CanonicalTodos *[]evidence.TodoItem `json:"canonicalTodos,omitempty"`
 }
@@ -6899,7 +6943,6 @@ func (a *App) MetaForTab(tabID string) Meta {
 		Bypass:            autoApproveTools,
 		CollaborationMode: collaborationMode,
 		ToolApprovalMode:  toolApprovalMode,
-		AgentPreset:       boot.NormalizeAgentPreset(tokenMode),
 		TokenMode:         tokenMode,
 		Goal:              goal,
 		GoalStatus:        goalStatus,
@@ -10026,15 +10069,14 @@ func (a *App) SetModelForTab(tabID, name string) (retErr error) {
 
 	stageStarted = time.Now()
 	newCtrl, err := boot.Build(a.bootContext(), boot.Options{
-		Model:                    name,
-		RequireKey:               false,
-		AutoPricingCurrency:      a.desktopAutoPricingCurrency(),
-		StatsSource:              "desktop",
+		Model:               name,
+		RequireKey:          false,
+		AutoPricingCurrency: a.desktopAutoPricingCurrency(),
+		StatsSource:         "desktop", OnConfigLoadWarnings: a.configLoadWarningsHandler(),
 		Sink:                     snap.sink,
 		WorkspaceRoot:            snap.workspaceRoot,
 		SessionDir:               sessionDirForSnapshot(snap),
 		EffortOverride:           cloneStringPtr(effortOverride),
-		AgentPreset:              boot.NormalizeAgentPreset(runtime.tokenMode),
 		TokenMode:                runtime.tokenMode,
 		SharedHost:               sharedHost,
 		CleanupPendingReconciler: reconcileDesktopCleanupPending,
@@ -10210,15 +10252,14 @@ func (a *App) SetEffortForTab(tabID, level string) error {
 	}
 	sharedHost := a.lookupSharedHost(snap.sharedHostKey)
 	newCtrl, err := boot.Build(a.bootContext(), boot.Options{
-		Model:                    modelRef,
-		RequireKey:               false,
-		AutoPricingCurrency:      a.desktopAutoPricingCurrency(),
-		StatsSource:              "desktop",
+		Model:               modelRef,
+		RequireKey:          false,
+		AutoPricingCurrency: a.desktopAutoPricingCurrency(),
+		StatsSource:         "desktop", OnConfigLoadWarnings: a.configLoadWarningsHandler(),
 		Sink:                     snap.sink,
 		WorkspaceRoot:            snap.workspaceRoot,
 		SessionDir:               sessionDirForSnapshot(snap),
 		EffortOverride:           &effort,
-		AgentPreset:              boot.NormalizeAgentPreset(runtime.tokenMode),
 		TokenMode:                runtime.tokenMode,
 		SharedHost:               sharedHost,
 		CleanupPendingReconciler: reconcileDesktopCleanupPending,
@@ -10272,25 +10313,11 @@ func (a *App) SetEffortForTab(tabID, level string) error {
 }
 
 func (a *App) SetTokenMode(mode string) error {
-	// Deprecated: dual-write alias for SetAgentPreset.
-	return a.SetAgentPreset(boot.NormalizeAgentPreset(mode))
+	return a.SetTokenModeForTab("", mode)
 }
 
 func (a *App) SetTokenModeForTab(tabID, mode string) error {
-	// Deprecated: dual-write alias for SetAgentPresetForTab.
-	return a.SetAgentPresetForTab(tabID, boot.NormalizeAgentPreset(mode))
-}
-
-// SetAgentPreset switches the active tab's role setting (角色设定).
-func (a *App) SetAgentPreset(preset string) error {
-	return a.SetAgentPresetForTab("", preset)
-}
-
-// SetAgentPresetForTab switches a tab's role setting without rebuilding the
-// controller. Active turns, background jobs, and pending approvals/asks refuse.
-func (a *App) SetAgentPresetForTab(tabID, preset string) error {
-	preset = boot.NormalizeAgentPreset(preset)
-	legacyMode := boot.TokenModeFromAgentPreset(preset)
+	mode = boot.NormalizeTokenMode(mode)
 	tab := a.tabByID(tabID)
 	if tab == nil {
 		if strings.TrimSpace(tabID) == "" {
@@ -10299,12 +10326,12 @@ func (a *App) SetAgentPresetForTab(tabID, preset string) error {
 		return fmt.Errorf("tab %q not found", tabID)
 	}
 	a.mu.RLock()
-	currentPreset := boot.NormalizeAgentPreset(tab.tokenMode)
+	currentMode := boot.NormalizeTokenMode(tab.tokenMode)
 	a.mu.RUnlock()
-	if preset == currentPreset {
+	if mode == currentMode {
 		return nil
 	}
-	// Serialize with model/effort/settings rebuilds and turn admission.
+	// Build+swap path; serialize with the other rebuild paths (see runtimeRebuildMu).
 	a.runtimeRebuildMu.Lock()
 	defer a.runtimeRebuildMu.Unlock()
 	tab.turnStartMu.Lock()
@@ -10313,46 +10340,115 @@ func (a *App) SetAgentPresetForTab(tabID, preset string) error {
 	if prevPath == "" {
 		prevPath = a.currentSessionPathFor(tab)
 	}
+	// Recomputing prevPath after this attach would be a dead store: it is
+	// unconditionally derived again after ensureTabControllerWorkspace below.
 	if a.controllerForTab(tab) == nil && prevPath != "" {
 		a.attachExistingSessionRuntime(tab, prevPath, a.ctx)
 	}
-	if err := rebuildControllerActiveWorkErrorFor(a.controllerForTab(tab), "角色设定"); err != nil {
+	if err := rebuildControllerActiveWorkErrorFor(a.controllerForTab(tab), "token mode"); err != nil {
 		return err
 	}
 	if err := a.ensureTabControllerWorkspace(tab); err != nil {
 		return err
 	}
-	ctrl := a.controllerForTab(tab)
-	if ctrl == nil {
-		// No live controller yet: persist the choice for the next build.
-		a.mu.Lock()
-		tab.tokenMode = legacyMode
-		a.mu.Unlock()
-		a.persistTabTokenMode(tab, legacyMode)
-		return nil
+	prevPath = a.reconciledSessionPathForTab(tab)
+	if prevPath == "" {
+		prevPath = a.currentSessionPathFor(tab)
 	}
-	// In-place switch: update the agent atomic value, tab state, and dual-write
-	// persistence without boot.Build.
-	ctrl.SetAgentPreset(preset)
-	a.mu.Lock()
-	tab.tokenMode = legacyMode
-	a.mu.Unlock()
-	a.persistTabTokenMode(tab, legacyMode)
-	a.notifyTabRuntimeRebuilt(tab)
-	return nil
-}
+	if a.controllerForTab(tab) == nil && prevPath != "" && a.attachExistingSessionRuntime(tab, prevPath, a.ctx) {
+		prevPath = a.reconciledSessionPathForTab(tab)
+		if prevPath == "" {
+			prevPath = a.currentSessionPathFor(tab)
+		}
+		if err := rebuildControllerActiveWorkErrorFor(a.controllerForTab(tab), "token mode"); err != nil {
+			return err
+		}
+	}
+	modelRef, fallback, err := a.resolvedModelForTab(tab)
+	if err != nil {
+		return err
+	}
+	snap := a.tabRuntimeSnapshot(tab)
+	runtime := snap.normalizedRuntime()
+	runtime.tokenMode = mode
+	if fallback && strings.TrimSpace(snap.model) != "" {
+		a.noticeForTab(tab.ID, fmt.Sprintf("model %q is no longer available; switched to %s", snap.model, modelRef))
+	}
 
-// persistTabTokenMode dual-writes tokenMode (legacy) for the role setting.
-// Failures keep the in-memory preset (already applied).
-func (a *App) persistTabTokenMode(tab *WorkspaceTab, mode string) {
-	if a == nil || tab == nil {
-		return
+	var carried []provider.Message
+	oldCtrl := a.controllerForTab(tab)
+	if oldCtrl != nil {
+		if prevPath == "" {
+			prevPath = oldCtrl.SessionPath()
+		}
+		if err := a.ensureTabSessionLeaseForRebuild(tab, prevPath, "token mode"); err != nil {
+			return err
+		}
+		if err := a.snapshotTabForAction(tab, "changing token mode"); err != nil {
+			return err
+		}
+		prevPath = sessionPathAfterSnapshot(oldCtrl, prevPath)
+		carried = oldCtrl.History()
 	}
-	_ = mode
+	sharedHost := a.lookupSharedHost(snap.sharedHostKey)
+	newCtrl, err := boot.Build(a.bootContext(), boot.Options{
+		Model:               modelRef,
+		RequireKey:          false,
+		AutoPricingCurrency: a.desktopAutoPricingCurrency(),
+		StatsSource:         "desktop", OnConfigLoadWarnings: a.configLoadWarningsHandler(),
+		Sink:                     snap.sink,
+		WorkspaceRoot:            snap.workspaceRoot,
+		SessionDir:               sessionDirForSnapshot(snap),
+		EffortOverride:           cloneStringPtr(snap.effort),
+		TokenMode:                mode,
+		SharedHost:               sharedHost,
+		CleanupPendingReconciler: reconcileDesktopCleanupPending,
+		SubagentParentLive:       a.subagentParentProbeForBuild(tab),
+		SessionRecoveryMeta:      a.tabSessionRecoveryMeta(tab),
+		OnSessionRecovered:       a.handleTabSessionRecovered(tab),
+		// Same logical session: keep the private temporary directory across
+		// token-mode switches (Issue #7575).
+		SessionTemp: sessionTempFromController(oldCtrl),
+	})
+	if err != nil {
+		return err
+	}
+	a.bindControllerDisplayRecorder(newCtrl)
+	configureControllerRuntime(newCtrl, oldCtrl, runtime)
+	path := agent.ContinueSessionPath(prevPath, newCtrl.SessionDir(), newCtrl.Label())
+	if err := a.ensureTabSessionLeaseForRebuild(tab, path, "token mode"); err != nil {
+		newCtrl.Close()
+		return err
+	}
+	restoredRuntime, err := resumeControllerRuntimeWithMessages(newCtrl, carried, path, runtime)
+	if err != nil {
+		newCtrl.Close()
+		return err
+	}
 	a.mu.Lock()
+	if current := a.tabs[tab.ID]; current != tab {
+		a.mu.Unlock()
+		newCtrl.Close()
+		tab.releaseSessionLease()
+		return fmt.Errorf("tab %q changed while switching token mode; retry", tab.ID)
+	}
+	tab.Ctrl = newCtrl
+	tab.model = modelRef
+	tab.Label = newCtrl.Label()
+	applyNormalizedRuntimeToTabLocked(tab, restoredRuntime)
+	clearTabStartupError(tab)
+	tab.Ready = true
+	a.supersedeTabBuildLocked(tab)
 	a.saveTabsLocked()
 	a.mu.Unlock()
-	_ = a.saveTabSessionMetaForCurrentSession(tab)
+	if oldCtrl != nil {
+		oldCtrl.Close()
+	}
+	// The rebuilt runtime reflects the on-disk config; drop any deferred refresh.
+	a.clearDeferredRebuild(tab.ID)
+	a.persistTabSessionPath(tab, path)
+	a.notifyTabRuntimeRebuilt(tab)
+	return nil
 }
 
 func (a *App) applyProviderEffortConfig(entry *config.ProviderEntry, effort string) error {
@@ -10929,6 +11025,26 @@ func (a *App) currentProviderEntryForTab(tabID string) (*config.ProviderEntry, e
 		entry.Effort = *effortOverride
 	}
 	return entry, nil
+}
+
+func (a *App) resolvedModelForTab(tab *WorkspaceTab) (string, bool, error) {
+	if tab == nil {
+		return "", false, fmt.Errorf("no active tab")
+	}
+	cfg, err := config.LoadForRoot(tab.WorkspaceRoot)
+	if err != nil {
+		return "", false, err
+	}
+	ref := strings.TrimSpace(tab.model)
+	if ref == "" {
+		ref = cfg.DefaultModel
+	}
+	config.NormalizeLegacyMimoCustomProvidersForRefs(cfg, ref)
+	resolved, fallback, ok := cfg.ResolveModelWithFallback(ref)
+	if !ok {
+		return "", false, fmt.Errorf("unknown model %q", ref)
+	}
+	return resolved, fallback, nil
 }
 
 func (a *App) withActiveWorkspace(fn func() (string, error)) (string, error) {
