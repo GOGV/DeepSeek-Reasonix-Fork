@@ -109,9 +109,11 @@ func (o *turnOrchestrator) runSubagentSkillTurns(ctx context.Context, skills []s
 	c.maybeSessionStart(ctx)
 	parentSession := c.parentSessionID()
 	images := c.inputImages(raw)
+	imageCandidates := c.resolveInputImageCandidates(raw)
 	ctx = agent.WithParentSession(ctx, parentSession)
 	ctx = jobs.WithSession(ctx, parentSession)
 	ctx = agent.WithUserImages(ctx, images)
+	ctx = agent.WithSubagentImageCandidates(ctx, imageCandidates)
 	ctx = agent.WithResponseLanguagePreference(ctx, c.responseLanguage)
 	ctx = agent.WithReasoningLanguagePreference(ctx, c.reasoningLanguage)
 
@@ -194,7 +196,9 @@ func (o *turnOrchestrator) runOrchestratedTurn(ctx context.Context, turn orchest
 	ctx = agent.WithParentSession(ctx, parentSession)
 	ctx = jobs.WithSession(ctx, parentSession)
 	userImages := c.inputImages(turn.input)
+	imageCandidates := c.resolveInputImageCandidates(turn.raw)
 	ctx = agent.WithUserImages(ctx, userImages)
+	ctx = agent.WithSubagentImageCandidates(ctx, imageCandidates)
 	ctx = agent.WithRawUserInput(ctx, turn.raw)
 	continuation := turn.goalContinuation
 	var input string

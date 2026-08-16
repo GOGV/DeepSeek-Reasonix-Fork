@@ -1924,6 +1924,7 @@ func (c *Controller) Run(ctx context.Context, input string) (err error) {
 	ctx = agent.WithParentSession(ctx, parentSession)
 	ctx = jobs.WithSession(ctx, parentSession)
 	ctx = agent.WithUserImages(ctx, c.inputImages(input))
+	ctx = agent.WithSubagentImageCandidates(ctx, c.resolveInputImageCandidates(input))
 	rawInput := input
 	ctx = agent.WithRawUserInput(ctx, rawInput)
 	input = c.Compose(input)
@@ -1995,6 +1996,7 @@ func (c *Controller) RunSubagentProfile(ctx context.Context, name, task string, 
 	ctx = agent.WithParentSession(ctx, parentSession)
 	ctx = jobs.WithSession(ctx, parentSession)
 	ctx = agent.WithUserImages(ctx, c.inputImages(task))
+	ctx = agent.WithSubagentImageCandidates(ctx, c.resolveInputImageCandidates(task))
 	ctx = agent.WithResponseLanguagePreference(ctx, c.responseLanguage)
 	ctx = agent.WithReasoningLanguagePreference(ctx, c.reasoningLanguage)
 	ctx = agent.WithSubagentDepth(ctx, 0)
