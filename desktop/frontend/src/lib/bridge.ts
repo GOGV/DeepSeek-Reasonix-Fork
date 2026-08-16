@@ -1,6 +1,8 @@
-// bridge is the seam between React and the Go kernel. The Wails shell calls bound
-// App methods and subscribes to runtime events; in a plain browser (`pnpm dev`),
-// a mock streams a canned turn through the same contract so the whole UI can be
+// bridge is the single seam between the React app and the Go kernel. In the Wails
+// shell it calls the bound App methods (window.go.main.App.*) and subscribes to
+// the runtime event stream (window.runtime.EventsOn). In a plain browser (`pnpm
+// dev` outside the shell) those globals are absent, so it falls back to a mock
+// that streams a canned turn through the same contract — letting the whole UI be
 // developed and laid out without rebuilding the Go side.
 
 // @ts-ignore `wails generate module` creates this locally; fresh checkouts keep
@@ -18,9 +20,6 @@ import { modeHasAutoApproveTools, modeWithAutoApproveTools, modeWithPlan, normal
 import { decisionSurfaceMockFromInput, isLongDecisionOptionsMockInput } from "./decisionSurfaceMock";
 
 import type {
-  AutoResearchFindingView,
-  AutoResearchEvidenceView,
-  AutoResearchStatusView,
   RemoteHostView,
   RemoteHostInput,
   RemoteConnectionStatus,
@@ -126,7 +125,7 @@ import type {
 
 const GLOBAL_PROJECT_ORDER_KEY = "__global__";
 
-function stripGoalResearchFlags(arg: string): string {
+function stripLegacyGoalBudgetFlags(arg: string): string {
   const parts = arg.trim().split(/\s+/).filter(Boolean);
   while (parts.length > 0) {
     const flag = parts[0].toLowerCase();
@@ -176,14 +175,20 @@ export interface AppBindings {
   HeartbeatListTasks(): Promise<unknown>;
   HeartbeatReloadTasks(): Promise<unknown>;
   HeartbeatSaveTasks(tasks: unknown): Promise<void>;
+  HeartbeatReloadConfig(): Promise<unknown>;
+  HeartbeatSaveConfig(update: unknown): Promise<unknown>;
   HeartbeatTriggerNow(id: string): Promise<void>;
   HeartbeatGenerateID(): Promise<string>;
   Submit(input: string): Promise<void>;
   SubmitToTab(tabID: string, input: string): Promise<void>;
+  SubmitToTabWithID(tabID: string, input: string, submissionID: string): Promise<void>;
   SubmitDisplay(display: string, input: string): Promise<void>;
   SubmitDisplayToTab(tabID: string, display: string, input: string): Promise<void>;
+  SubmitDisplayToTabWithID(tabID: string, display: string, input: string, submissionID: string): Promise<void>;
   SubmitDeliveryRecoveryToTab(tabID: string, display: string, input: string): Promise<void>;
+  SubmitDeliveryRecoveryToTabWithID(tabID: string, display: string, input: string, submissionID: string): Promise<void>;
   SubmitInvocationsToTab(tabID: string, display: string, input: string, invocations: InvocationRequest[]): Promise<void>;
+  SubmitInvocationsToTabWithID(tabID: string, display: string, input: string, invocations: InvocationRequest[], submissionID: string): Promise<void>;
   SubmitInitialGoalToTab(
     tabID: string,
     goal: string,
@@ -193,51 +198,15 @@ export interface AppBindings {
     collaborationMode: string,
     toolApprovalMode: string,
   ): Promise<string[]>;
+  SubmitInitialGoalToTabWithID(tabID: string, goal: string, display: string, input: string, invocations: InvocationRequest[], collaborationMode: string, toolApprovalMode: string, submissionID: string): Promise<string[]>;
   SubmitEditedDisplayToTab(tabID: string, display: string, input: string, original: string): Promise<void>;
+  SubmitEditedDisplayToTabWithID(tabID: string, display: string, input: string, original: string, submissionID: string): Promise<void>;
   RunShell(command: string): Promise<void>;
   RunShellForTab(tabID: string, command: string): Promise<void>;
   Steer(text: string): Promise<void>;
   SteerForTab(tabID: string, text: string): Promise<void>;
-  InboxSnapshot(tabID: string): Promise<{
-    revision: number;
-    paused: boolean;
-    recovered: boolean;
-    recoveredCount?: number;
-    items: Array<{
-      id: string;
-      intent: string;
-      state: string;
-      preview: string;
-      byteSize: number;
-      source?: string;
-      position: number;
-      blockReason?: string;
-    }>;
-    itemsCount: number;
-    bytes: number;
-    maxItems: number;
-    maxBytes: number;
-  }>;
-  EnqueueInboxFollowup(tabID: string, display: string, submit: string, idempotency: string): Promise<{
-    itemId: string; disposition: string; position: number; paused: boolean; idempotent?: boolean; error?: string;
-  }>;
-  EnqueueInboxSteer(tabID: string, display: string, submit: string, idempotency: string): Promise<{
-    itemId: string; disposition: string; position: number; paused: boolean; idempotent?: boolean; error?: string;
-  }>;
-  SteerInboxItem(tabID: string, itemID: string): Promise<{
-    itemId: string; disposition: string; position: number; paused: boolean; idempotent?: boolean; error?: string;
-  }>;
-  ReadInboxItem(tabID: string, id: string): Promise<{ id: string; displayText: string; rawText: string; submitText: string }>;
-  UpdateInboxItem(tabID: string, id: string, display: string, submit: string): Promise<void>;
-  DeleteInboxItem(tabID: string, id: string): Promise<void>;
-  MoveInboxItem(tabID: string, id: string, toIndex: number): Promise<void>;
-  SetInboxPaused(tabID: string, paused: boolean): Promise<void>;
-  RetryInboxItem(tabID: string, id: string): Promise<void>;
-  RefreshInboxItem(tabID: string, id: string): Promise<void>;
-  InboxHasItems(tabID: string): Promise<boolean>;
   Cancel(): Promise<void>;
   CancelTab(tabID: string): Promise<void>;
-  CancelTabWithInboxItems(tabID: string, itemIDs: string[]): Promise<void>;
   Approve(id: string, allow: boolean, session: boolean, persist: boolean): Promise<void>;
   ApproveTab(tabID: string, id: string, allow: boolean, session: boolean, persist: boolean): Promise<void>;
   ResolvePlanDecision(id: string, action: "start_execution" | "revise_plan" | "exit_plan"): Promise<void>;
@@ -356,12 +325,6 @@ export interface AppBindings {
   ToolResultForTab(tabID: string, toolID: string): Promise<{ args: string; output: string; execution?: import("./types").WireShellExecution } | null>;
   Meta(): Promise<Meta>;
   MetaForTab(tabID: string): Promise<Meta>;
-  AutoResearchCurrent(): Promise<AutoResearchStatusView>;
-  AutoResearchStatus(tabID: string): Promise<AutoResearchStatusView>;
-  AutoResearchList(tabID: string): Promise<AutoResearchStatusView[]>;
-  AutoResearchFindings(tabID: string, limit: number): Promise<AutoResearchFindingView[]>;
-  AutoResearchOpenTask(tabID: string): Promise<void>;
-  AutoResearchRecordEvidence(tabID: string, criterionID: string, input: AutoResearchEvidenceView): Promise<void>;
   Commands(): Promise<CommandInfo[]>;
   Capabilities(): Promise<CapabilitiesView>;
   MCPServers(): Promise<ServerView[]>;
@@ -425,12 +388,10 @@ export interface AppBindings {
   WorkspaceGitCommitDetail(tabID: string, hash: string, path: string): Promise<GitCommitDetailView>;
   OpenWorkspacePath(rel: string): Promise<void>;
   OpenWorkspacePathForTab(tabID: string, rel: string): Promise<void>;
-  ResolveWorkspacePathForTab(tabID: string, rel: string): Promise<string>;
-  ExternalOpeners(): Promise<ExternalOpenersView>;
-  ExternalOpenersForTab(tabID: string): Promise<ExternalOpenersView>;
+  ExternalOpeners(): Promise<ExternalOpenersView>; ExternalOpenersForTab(tabID: string): Promise<ExternalOpenersView>;
   SetPreferredExternalOpener(id: string): Promise<void>;
   OpenWorkspaceInExternalOpener(id: string): Promise<void>;
-  OpenWorkspaceInExternalOpenerForTab(tabID: string, id: string): Promise<void>;
+  OpenWorkspaceInExternalOpenerForTab(tabID: string, id: string): Promise<void>; OpenLocalPathInExternalOpener(path: string, id: string): Promise<void>; SaveLocalPathAs(path: string): Promise<string>;
   RevealWorkspacePath(rel: string): Promise<void>;
   RevealWorkspacePathForTab(tabID: string, rel: string): Promise<void>;
   RevealPath(path: string): Promise<void>;
@@ -2220,13 +2181,13 @@ function makeMockApp(): AppBindings {
     if (!tabId) return;
     mockTabs = mockTabs.map((tab) => (tab.id === tabId ? { ...tab, running } : tab));
   };
-  const emitMockTurnStarted = () => {
+  const emitMockTurnStarted = (submissionId?: string) => {
     setMockTabRunning(currentMockTurnTabId(), true);
-    emit({ kind: "turn_started" });
+    emit({ kind: "turn_started", submissionId });
   };
-  const emitMockTurnDone = () => {
+  const emitMockTurnDone = (submissionId?: string) => {
     setMockTabRunning(currentMockTurnTabId(), false);
-    emit({ kind: "turn_done" });
+    emit({ kind: "turn_done", submissionId });
   };
   // Fresh user decisions never auto-allow on a posture switch (mirrors the
   // backend's requiresFreshApprovalTool set).
@@ -2462,25 +2423,25 @@ function makeMockApp(): AppBindings {
       if (/Mac/i.test(ua)) return "darwin";
       return "linux";
     },
-        async Submit(input) {
+        async Submit(input, submissionID?: string) {
           cancelled = false;
-      emitMockTurnStarted();
+      emitMockTurnStarted(submissionID);
       const trimmedInput = input.trim().toLowerCase();
       const decisionSurfaceMock = decisionSurfaceMockFromInput(trimmedInput);
       const goalMatch = /^\/goal(?:\s+([\s\S]*))?$/.exec(input.trim());
       if (goalMatch) {
-        const arg = stripGoalResearchFlags((goalMatch[1] ?? "").trim());
+        const arg = stripLegacyGoalBudgetFlags((goalMatch[1] ?? "").trim());
         const lowered = arg.toLowerCase();
         const active = mockTabs.find((tab) => tab.active);
         if (!arg || lowered === "status") {
           emit({ kind: "notice", level: "info", text: active?.goal ? `goal: ${active.goal}` : "goal: none" });
-          emitMockTurnDone();
+          emitMockTurnDone(submissionID);
           return;
         }
         if (["clear", "off", "stop", "done"].includes(lowered)) {
           mockTabs = mockTabs.map((tab) => (tab.active ? { ...tab, goal: "", goalStatus: "stopped", collaborationMode: "normal" } : tab));
           emit({ kind: "notice", level: "info", text: "goal cleared" });
-          emitMockTurnDone();
+          emitMockTurnDone(submissionID);
           return;
         }
         mockTabs = mockTabs.map((tab) => (tab.active ? { ...tab, goal: arg, goalStatus: "running", collaborationMode: "goal" } : tab));
@@ -2491,7 +2452,7 @@ function makeMockApp(): AppBindings {
         emit({ kind: "message", text: reply });
         mockTabs = mockTabs.map((tab) => (tab.active ? { ...tab, goal: "", goalStatus: "complete", collaborationMode: "normal" } : tab));
         emit({ kind: "notice", level: "info", text: "goal complete" });
-        emitMockTurnDone();
+        emitMockTurnDone(submissionID);
         return;
       }
       if (decisionSurfaceMock === "tool_approval") {
@@ -2727,7 +2688,7 @@ function makeMockApp(): AppBindings {
             durationMs: 150,
           },
         });
-        emitMockTurnDone();
+        emitMockTurnDone(submissionID);
         return;
       }
       if (trimmedInput === "/process-preview" || trimmedInput === "process preview" || trimmedInput === "过程预览") {
@@ -2750,7 +2711,7 @@ function makeMockApp(): AppBindings {
           },
         });
         emit({ kind: "message", text: "Process card preview complete." });
-        emitMockTurnDone();
+        emitMockTurnDone(submissionID);
         return;
       }
       if (trimmedInput === "/nested-preview" || trimmedInput === "nested preview" || trimmedInput === "嵌套预览") {
@@ -2811,7 +2772,7 @@ function makeMockApp(): AppBindings {
           kind: "message",
           text: "Mock nested tool preview complete. The explore row now shows the compass count marker.",
         });
-        emitMockTurnDone();
+        emitMockTurnDone(submissionID);
         return;
       }
       // Simulate the server's pre-first-token latency so the deferred user bubble
@@ -2868,23 +2829,17 @@ function makeMockApp(): AppBindings {
           sessionCacheMissTokens: 256,
         },
       });
-          emitMockTurnDone();
+          emitMockTurnDone(submissionID);
         },
-        async SubmitToTab(_tabID, input) {
-          await withMockTabScope(_tabID, () => this.Submit(input));
-        },
-        async SubmitDisplay(_display, input) {
-          await this.Submit(input);
-        },
-        async SubmitDisplayToTab(_tabID, display, input) {
-          await withMockTabScope(_tabID, () => this.SubmitDisplay(display, input));
-        },
-        async SubmitDeliveryRecoveryToTab(_tabID, display, input) {
-          await withMockTabScope(_tabID, () => this.SubmitDisplay(display, input));
-        },
-        async SubmitInvocationsToTab(_tabID, display, input, _invocations) {
-          await withMockTabScope(_tabID, () => this.SubmitDisplay(display, input));
-        },
+        async SubmitToTab(_tabID, input) { await withMockTabScope(_tabID, () => this.Submit(input)); },
+        async SubmitToTabWithID(_tabID, input, submissionID) { const submit = this.Submit as (value: string, id?: string) => Promise<void>; await withMockTabScope(_tabID, () => submit(input, submissionID)); },
+        async SubmitDisplay(_display, input) { await this.Submit(input); },
+        async SubmitDisplayToTab(_tabID, display, input) { await withMockTabScope(_tabID, () => this.SubmitDisplay(display, input)); },
+        async SubmitDisplayToTabWithID(_tabID, _display, input, submissionID) { await this.SubmitToTabWithID(_tabID, input, submissionID); },
+        async SubmitDeliveryRecoveryToTab(_tabID, display, input) { await withMockTabScope(_tabID, () => this.SubmitDisplay(display, input)); },
+        async SubmitDeliveryRecoveryToTabWithID(_tabID, _display, input, submissionID) { await this.SubmitToTabWithID(_tabID, input, submissionID); },
+        async SubmitInvocationsToTab(_tabID, display, input, _invocations) { await withMockTabScope(_tabID, () => this.SubmitDisplay(display, input)); },
+        async SubmitInvocationsToTabWithID(_tabID, _display, input, _invocations, submissionID) { await this.SubmitToTabWithID(_tabID, input, submissionID); },
         async SubmitInitialGoalToTab(
           _tabID,
           goal,
@@ -2904,9 +2859,9 @@ function makeMockApp(): AppBindings {
             return [];
           });
         },
-        async SubmitEditedDisplayToTab(_tabID, display, input, _original) {
-          await withMockTabScope(_tabID, () => this.SubmitDisplay(display, input));
-        },
+        async SubmitInitialGoalToTabWithID(_tabID, goal, display, input, invocations, _collaborationMode, _toolApprovalMode, submissionID) { await this.SetGoalForTab(_tabID, goal); if (invocations.length > 0) await this.SubmitInvocationsToTabWithID(_tabID, display, input, invocations, submissionID); else await this.SubmitDisplayToTabWithID(_tabID, display, input, submissionID); return []; },
+        async SubmitEditedDisplayToTab(_tabID, display, input, _original) { await withMockTabScope(_tabID, () => this.SubmitDisplay(display, input)); },
+        async SubmitEditedDisplayToTabWithID(_tabID, display, input, _original, submissionID) { await this.SubmitDisplayToTabWithID(_tabID, display, input, submissionID); },
         async RunShell(command) {
           cancelled = false;
           emitMockTurnStarted();
@@ -2932,49 +2887,11 @@ function makeMockApp(): AppBindings {
         async SteerForTab(_tabID, _text) {
           await this.Steer(_text);
         },
-        async InboxSnapshot(_tabID) {
-          return {
-            revision: 0,
-            paused: false,
-            recovered: false,
-            items: [],
-            itemsCount: 0,
-            bytes: 0,
-            maxItems: 64,
-            maxBytes: 64 * 1024 * 1024,
-          };
-        },
-        async EnqueueInboxFollowup(_tabID, _display, _submit, _idempotency) {
-          const itemId = `mock-${Date.now()}`;
-          return { itemId, disposition: "queued_followup", position: 1, paused: false };
-        },
-        async EnqueueInboxSteer(_tabID, display, submit, _idempotency) {
-          const itemId = `mock-steer-${Date.now()}`;
-          emit({ kind: "steer", text: submit || display, itemId });
-          return { itemId, disposition: "steer_accepted", position: 1, paused: false };
-        },
-        async SteerInboxItem(_tabID, itemID) {
-          emit({ kind: "steer", itemId: itemID });
-          return { itemId: itemID, disposition: "steer_accepted", position: 1, paused: false };
-        },
-        async ReadInboxItem(_tabID, id) {
-          return { id, displayText: "", rawText: "", submitText: "" };
-        },
-        async UpdateInboxItem() {},
-        async DeleteInboxItem() {},
-        async MoveInboxItem() {},
-        async SetInboxPaused() {},
-        async RetryInboxItem() {},
-        async RefreshInboxItem() {},
-        async InboxHasItems() { return false; },
         async Cancel() {
           cancelled = true;
           emitMockTurnDone();
         },
         async CancelTab(_tabID) {
-          await withMockTabScope(_tabID, () => this.Cancel());
-        },
-        async CancelTabWithInboxItems(_tabID, _itemIDs) {
           await withMockTabScope(_tabID, () => this.Cancel());
         },
         async Approve(_id, allow, session, persist) {
@@ -3465,7 +3382,6 @@ function makeMockApp(): AppBindings {
             tokenMode: normalizeTokenMode(active?.tokenMode),
             goal: active?.goal ?? "",
             goalStatus: active?.goalStatus ?? (active?.goal ? "running" : "stopped"),
-            autoResearch: active?.goal ? { taskId: "mock-autoresearch", status: "running", iteration: 4, pivotRequired: false, staleCount: 0 } : undefined,
           };
         },
         async MetaForTab(tabID) {
@@ -3491,79 +3407,7 @@ function makeMockApp(): AppBindings {
             tokenMode: normalizeTokenMode(tab?.tokenMode),
             goal: tab?.goal ?? "",
             goalStatus: tab?.goalStatus ?? (tab?.goal ? "running" : "stopped"),
-            autoResearch: tab?.goal ? { taskId: "mock-autoresearch", status: "running", iteration: 4, pivotRequired: false, staleCount: 0 } : undefined,
           };
-        },
-        async AutoResearchCurrent() {
-          return {
-            taskId: "mock-autoresearch",
-            goal: "Mock long-running research",
-            status: "running",
-            iteration: 4,
-            currentDirection: "Inspect status chip",
-            staleCount: 0,
-            pivotCount: 0,
-            pivotRequired: false,
-            lastHeartbeatAt: "2026-06-29T00:00:00Z",
-            findingCount: 1,
-            openCriteria: [],
-            blocker: "",
-            taskPath: "/tmp/mock/.reasonix/autoresearch/mock-autoresearch",
-            nextRequiredAction: "continue with the next evidence-producing step",
-          };
-        },
-        async AutoResearchStatus(_tabID) {
-          return {
-            taskId: "mock-autoresearch",
-            goal: "Mock long-running research",
-            status: "running",
-            iteration: 4,
-            currentDirection: "Inspect status chip",
-            staleCount: 0,
-            pivotCount: 0,
-            pivotRequired: false,
-            lastHeartbeatAt: "2026-06-29T00:00:00Z",
-            findingCount: 1,
-            openCriteria: [],
-            blocker: "",
-            taskPath: "/tmp/mock/.reasonix/autoresearch/mock-autoresearch",
-            nextRequiredAction: "continue with the next evidence-producing step",
-          };
-        },
-        async AutoResearchList(_tabID) {
-          return [{
-            taskId: "mock-autoresearch",
-            goal: "Mock long-running research",
-            status: "running",
-            iteration: 4,
-            currentDirection: "Inspect status chip",
-            staleCount: 0,
-            pivotCount: 0,
-            pivotRequired: false,
-            lastHeartbeatAt: "2026-06-29T00:00:00Z",
-            findingCount: 1,
-            openCriteria: [],
-            blocker: "",
-            taskPath: "/tmp/mock/.reasonix/autoresearch/mock-autoresearch",
-            nextRequiredAction: "continue with the next evidence-producing step",
-          }];
-        },
-        async AutoResearchFindings(_tabID, limit) {
-          return [{
-            id: "f1",
-            kind: "test",
-            summary: "Mock accepted finding",
-            source: "command",
-            command: "go test ./...",
-            accepted: true,
-            createdAt: "2026-06-29T00:00:00Z",
-          }].slice(0, Math.max(0, limit || 1));
-        },
-        async AutoResearchOpenTask(_tabID) {
-          console.info("mock AutoResearchOpenTask");
-        },
-        async AutoResearchRecordEvidence(_tabID, _criterionID, _input) {
-          console.info("mock AutoResearchRecordEvidence");
         },
     async Commands() {
       const commands: CommandInfo[] = [
@@ -4138,7 +3982,6 @@ function makeMockApp(): AppBindings {
     async OpenWorkspacePathForTab(_tabID: string, rel: string) {
       await this.OpenWorkspacePath(rel);
     },
-    async ResolveWorkspacePathForTab(_tabID: string, rel: string) { return `${cwd.replace(/[\\/]+$/, "")}/${rel.replace(/^[/\\]+/, "").replace(/[\\/]+$/, "")}`; },
     async ExternalOpeners() {
       return {
         openers: [
@@ -4149,15 +3992,12 @@ function makeMockApp(): AppBindings {
         ],
         preferred: "vscode",
       } as ExternalOpenersView;
-    },
-    async ExternalOpenersForTab(_tabID: string) {
-      return { ...(await this.ExternalOpeners()), workspaceOpenable: true };
-    },
+    }, async ExternalOpenersForTab(_tabID: string) { return { ...(await this.ExternalOpeners()), workspaceOpenable: true }; },
     async SetPreferredExternalOpener(_id: string) {},
     async OpenWorkspaceInExternalOpener(_id: string) {},
     async OpenWorkspaceInExternalOpenerForTab(_tabID: string, id: string) {
       await this.OpenWorkspaceInExternalOpener(id);
-    },
+    }, async OpenLocalPathInExternalOpener(path: string, id: string) { console.info("mock OpenLocalPathInExternalOpener", path, id); }, async SaveLocalPathAs(path: string) { console.info("mock SaveLocalPathAs", path); return path; },
     async RevealWorkspacePath(rel: string) {
       console.info("mock RevealWorkspacePath", rel);
     },
@@ -4974,6 +4814,8 @@ function makeMockApp(): AppBindings {
     async HeartbeatListTasks() { return []; },
     async HeartbeatReloadTasks() { return []; },
     async HeartbeatSaveTasks(_tasks: unknown) {},
+    async HeartbeatReloadConfig() { return { revision: 0, etag: "", tasks: [] }; },
+    async HeartbeatSaveConfig(_update: unknown) { return { revision: 0, etag: "", tasks: [] }; },
     async HeartbeatTriggerNow(_id: string) {},
     async HeartbeatGenerateID() { return "mock-" + Date.now().toString(36); },
     async ListTasks() { return []; },
