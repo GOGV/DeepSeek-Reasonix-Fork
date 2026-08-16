@@ -70,6 +70,17 @@ func Open(ctx context.Context, opts Options) (*Catalog, error) {
 	if opts.QueueCapacity <= 0 {
 		opts.QueueCapacity = 1024
 	}
+	// An empty path (no cache dir) or explicit memory flag must never write a
+	// relative session-catalog file into the current project directory.
+	if strings.TrimSpace(opts.Path) == "" {
+		opts.Path = ""
+		opts.InMemory = true
+	}
+	if !opts.InMemory {
+		if env := strings.TrimSpace(os.Getenv("REASONIX_SESSION_CATALOG_MEMORY")); env == "1" {
+			opts.InMemory = true
+		}
+	}
 
 	c := &Catalog{
 		opts:           opts,
@@ -83,28 +94,30 @@ func Open(ctx context.Context, opts Options) (*Catalog, error) {
 		status:         Status{State: StateOpening, Path: opts.Path},
 	}
 	handle, err := projectiondb.Open(ctx, projectiondb.OpenOptions{
-		Path: opts.Path, MemoryName: "session-catalog", Migrations: schemaMigrations(),
-		InMemory:     opts.InMemory || os.Getenv("REASONIX_SESSION_CATALOG_MEMORY") == "1",
-		MaxOpenConns: 4, Now: opts.Now,
+		Path:       opts.Path,
+		MemoryName: "session-catalog",
+		Migrations: sessionMigrations(),
+		InMemory:   opts.InMemory,
+		Now:        opts.Now,
 	})
 	if err != nil {
 		return nil, err
 	}
-	db := handle.DB
-	c.db = db
+	c.db = handle.DB
 	c.status.Mode = Mode(handle.Status.Mode)
-	c.status.LastError = handle.Status.LastError
-	c.status.QuarantinedPath = handle.Status.QuarantinedPath
-	if handle.Status.State == projectiondb.StateDegraded {
-		c.status.State = StateDegraded
-	} else {
+	c.status.State = State(handle.Status.State)
+	if c.status.State == "" {
 		c.status.State = StateReady
 	}
-	if handle.Status.Mode == projectiondb.ModeMemory {
+	if c.status.Mode == ModeMemory {
 		c.status.Path = ""
+	} else {
+		c.status.Path = handle.Status.Path
 	}
+	c.status.LastError = handle.Status.LastError
+	c.status.QuarantinedPath = handle.Status.QuarantinedPath
 	if err := c.loadStatus(ctx); err != nil {
-		_ = db.Close()
+		_ = c.db.Close()
 		return nil, err
 	}
 	c.workerCtx, c.workerCancel = context.WithCancel(context.Background())
@@ -560,12 +573,14 @@ func (c *Catalog) ListTopics(ctx context.Context, req TopicPageRequest) (TopicPa
 }
 
 func (c *Catalog) listTopicSessions(ctx context.Context, key TopicKey) ([]SessionRecord, error) {
+	// Bound per-topic payload size so a recovery-heavy topic cannot emit an
+	// unbounded Wails payload on a single page fetch.
 	rows, err := c.db.QueryContext(ctx, `SELECT path,directory,scope,workspace_root,topic_id,topic_title,
         custom_title,created_at,last_activity_at,preview,turns,turns_state,recovered,
         recovery_reason,recovery_digest,parent_id,content_fingerprint,meta_fingerprint,
         health,missing_since FROM catalog_sessions
         WHERE scope=? AND workspace_root=? AND topic_id=?
-        ORDER BY last_activity_at DESC,path ASC`, key.Scope, key.WorkspaceRoot, key.TopicID)
+        ORDER BY last_activity_at DESC,path ASC LIMIT ?`, key.Scope, key.WorkspaceRoot, key.TopicID, MaxLimit)
 	if err != nil {
 		return nil, err
 	}

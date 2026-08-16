@@ -15,7 +15,8 @@ import (
 	"strings"
 	"time"
 
-	_ "modernc.org/sqlite"
+	moderncsqlite "modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 type Mode string
@@ -104,21 +105,33 @@ func Open(ctx context.Context, opts OpenOptions) (*Handle, error) {
 	db, err := open(ctx, opts, mode)
 	if err != nil && mode == ModeDisk {
 		var future *FutureSchemaError
-		if errors.As(err, &future) {
+		switch {
+		case errors.As(err, &future):
+			// A newer process wrote this projection. Keep the file intact and
+			// serve an empty memory projection so startup never quarantines a
+			// healthy future schema.
 			status.State = StateDegraded
 			status.LastError = err.Error()
 			mode = ModeMemory
 			db, err = open(ctx, opts, mode)
-		} else {
+		case isCorruptionError(err):
+			// Only integrity-level failures may rename the on-disk projection.
 			status.QuarantinedPath = Quarantine(opts.Path, opts.Now())
 			db, err = open(ctx, opts, mode)
+			if err != nil {
+				status.State = StateDegraded
+				status.LastError = err.Error()
+				mode = ModeMemory
+				db, err = open(ctx, opts, mode)
+			}
+		default:
+			// Busy, permission, IO, or transient open errors must never rename
+			// a healthy database. Fall back to memory for this process only.
+			status.State = StateDegraded
+			status.LastError = err.Error()
+			mode = ModeMemory
+			db, err = open(ctx, opts, mode)
 		}
-	}
-	if err != nil && mode == ModeDisk {
-		status.State = StateDegraded
-		status.LastError = err.Error()
-		mode = ModeMemory
-		db, err = open(ctx, opts, mode)
 	}
 	if err != nil {
 		return nil, err
@@ -295,6 +308,31 @@ func Quarantine(path string, now time.Time) string {
 		_ = os.Rename(path+suffix, quarantined+suffix)
 	}
 	return quarantined
+}
+
+// isCorruptionError reports whether err proves the on-disk projection is unsafe
+// to keep open. Temporary busy/permission/IO failures must return false so a
+// multi-process client never renames a healthy database out from under peers.
+func isCorruptionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var future *FutureSchemaError
+	if errors.As(err, &future) {
+		return false
+	}
+	var se *moderncsqlite.Error
+	if errors.As(err, &se) {
+		switch se.Code() & 0xff {
+		case sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB:
+			return true
+		}
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "integrity check") ||
+		strings.Contains(msg, "malformed") ||
+		strings.Contains(msg, "file is not a database") ||
+		strings.Contains(msg, "not a database")
 }
 
 func PathLooksRemote(path string) bool {

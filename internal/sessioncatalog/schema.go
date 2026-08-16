@@ -96,22 +96,15 @@ const migrationV2 = `
 ALTER TABLE catalog_topics ADD COLUMN metadata_present INTEGER NOT NULL DEFAULT 0;
 `
 
-const migrationV3 = `
-CREATE INDEX IF NOT EXISTS idx_catalog_sessions_history
-ON catalog_sessions(scope, workspace_root, last_activity_at DESC, path ASC);
-`
-
-func execMigration(statement string) func(context.Context, *sql.Tx) error {
-	return func(ctx context.Context, tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx, statement)
-		return err
-	}
-}
-
-func schemaMigrations() []projectiondb.Migration {
+func sessionMigrations() []projectiondb.Migration {
 	return []projectiondb.Migration{
-		{Version: 1, Apply: execMigration(migrationV1)},
-		{Version: 2, Apply: execMigration(migrationV2)},
-		{Version: 3, Apply: execMigration(migrationV3)},
+		{Version: 1, Apply: func(ctx context.Context, tx *sql.Tx) error {
+			_, err := tx.ExecContext(ctx, migrationV1)
+			return err
+		}},
+		{Version: 2, Apply: func(ctx context.Context, tx *sql.Tx) error {
+			_, err := tx.ExecContext(ctx, migrationV2)
+			return err
+		}},
 	}
 }

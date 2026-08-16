@@ -5,13 +5,14 @@ package sessioncatalog
 
 import (
 	"path/filepath"
+	"strings"
 	"time"
 
 	"reasonix/internal/config"
 )
 
 const (
-	SchemaVersion = 3
+	SchemaVersion = 2
 	DefaultLimit  = 50
 	MaxLimit      = 200
 )
@@ -158,23 +159,13 @@ type TopicPage struct {
 	Revision   uint64        `json:"revision"`
 }
 
-type SessionPageRequest struct {
-	Scope         string `json:"scope"`
-	WorkspaceRoot string `json:"workspaceRoot,omitempty"`
-	Directory     string `json:"-"`
-	Cursor        string `json:"cursor,omitempty"`
-	Limit         int    `json:"limit,omitempty"`
-	Query         string `json:"query,omitempty"`
-	TimeFilter    string `json:"timeFilter,omitempty"`
-}
-
-type SessionPage struct {
-	Items       []SessionRecord `json:"items"`
-	NextCursor  string          `json:"nextCursor,omitempty"`
-	Revision    uint64          `json:"revision"`
-	StaleCursor bool            `json:"staleCursor,omitempty"`
-}
-
+// DefaultPath returns the disposable session catalog path under CacheDir.
+// When the OS cache directory is unavailable it returns "" so callers fall
+// back to an in-memory projection instead of writing into the project tree.
 func DefaultPath() string {
-	return filepath.Join(config.CacheDir(), "session-catalog", "v1.sqlite")
+	cache := strings.TrimSpace(config.CacheDir())
+	if cache == "" {
+		return ""
+	}
+	return filepath.Join(cache, "session-catalog", "v1.sqlite")
 }
