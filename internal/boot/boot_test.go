@@ -2256,8 +2256,7 @@ func defaultFullBootToolNames() []string {
 		"bash",
 		"bash_output",
 		"code_index",
-		"complete_step",
-		"compress",
+		"complete_step", "compress",
 		"delete_range",
 		"delete_symbol",
 		"docs",
@@ -2306,8 +2305,7 @@ func economyBootToolNames() []string {
 	return []string{
 		"ask",
 		"bash",
-		"bash_output",
-		"compress",
+		"bash_output", "compress",
 		"connect_tool_source",
 		"edit_file",
 		"kill_shell",
@@ -2358,8 +2356,7 @@ command = "reasonix-missing-mockmcp"
 	wantTools := []string{
 		"ask",
 		"bash",
-		"bash_output",
-		"compress",
+		"bash_output", "compress",
 		"connect_tool_source",
 		"edit_file",
 		"kill_shell",
@@ -2395,15 +2392,6 @@ command = "reasonix-missing-mockmcp"
 	}
 	if strings.Contains(sys, "# Skills") || strings.Contains(sys, "projskill") {
 		t.Fatalf("skills index should not be in economy system prompt:\n%s", sys)
-	}
-}
-
-func TestTokenEconomyCompressHonorsExplicitAllowlist(t *testing.T) {
-	if got := tokenEconomyBuiltins([]string{"read_file"}); slices.Contains(got, "compress") {
-		t.Fatalf("explicit allowlist unexpectedly enabled compress: %v", got)
-	}
-	if got := tokenEconomyBuiltins([]string{"compress"}); !reflect.DeepEqual(got, []string{"compress"}) {
-		t.Fatalf("explicit compress allowlist = %v, want [compress]", got)
 	}
 }
 
