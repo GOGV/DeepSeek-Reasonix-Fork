@@ -2663,6 +2663,10 @@ export function useController() {
       const stillCurrent = () => sessionLoadCurrent(tabId, seq);
       const requiresVisibleTab = reason === "startup" || reason === "switch-tab" || reason === "open-topic";
       const stillVisible = () => !requiresVisibleTab || activeTabIdRef.current === tabId;
+      const foregroundTurnActive = (): boolean => {
+        const state = statesRef.current.get(tabId);
+        return Boolean(state?.running || state?.turnActive || state?.pendingPrompt);
+      };
       const noteFailure = (label: string, err: unknown) => {
         addBreadcrumb("tab.hydrate", `${label} failed ${tabId}: ${errorMessage(err)}`);
       };
@@ -2686,7 +2690,7 @@ export function useController() {
         : await loadTimed("history", () => app.HistoryPageForTab(tabId, 0, HISTORY_PAGE_TURNS));
 
       if (!stillCurrent()) return;
-      if (!skipHistory && historyPage !== undefined) {
+      if (!skipHistory && historyPage !== undefined && !foregroundTurnActive()) {
         const messages = asArray(historyPage.messages);
         dispatchTo(tabId, { type: "history_page", page: historyPage, mode: "replace" });
         addBreadcrumb(
@@ -2727,10 +2731,6 @@ export function useController() {
         return;
       }
       if (meta !== undefined) dispatchTo(tabId, { type: "meta", meta });
-      const foregroundTurnActive = (): boolean => {
-        const state = statesRef.current.get(tabId);
-        return Boolean(state?.running || state?.turnActive || state?.pendingPrompt);
-      };
       if (meta !== undefined && historyPage !== undefined && !skipHistory &&
         !foregroundTurnActive() && !historyPageMatchesMeta(historyPage, meta)) {
         // The transcript and metadata are persisted in separate files. A save
