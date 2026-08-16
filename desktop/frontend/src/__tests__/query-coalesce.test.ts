@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { coalescesQuery, resetQueryCoalescing, shareQuery } from "../lib/queryCoalesce";
+import { coalescesQuery, maybeShare, resetQueryCoalescing, shareQuery } from "../lib/queryCoalesce";
 
 function deferred<T>() {
   let resolve!: (v: T) => void;
@@ -30,6 +30,26 @@ async function differentArgumentsStayIndependent() {
   assert.equal(runs, 2, "another tab is another question");
 }
 
+async function settledAnswersAreNotReused() {
+  resetQueryCoalescing();
+  let runs = 0;
+  const run = async () => ++runs;
+  assert.equal(await shareQuery("MetaForTab", ["tab-1"], run), 1);
+  assert.equal(await shareQuery("MetaForTab", ["tab-1"], run), 2);
+  assert.equal(runs, 2, "a settled metadata answer must not survive a backend state change");
+}
+
+async function mutationsInvalidateInflightAnswers() {
+  resetQueryCoalescing();
+  const stale = deferred<string>();
+  const first = shareQuery("MetaForTab", ["tab-1"], () => stale.promise);
+  await maybeShare("NewSessionForTab", ["tab-1"], async () => undefined);
+  const fresh = await shareQuery("MetaForTab", ["tab-1"], async () => "fresh");
+  assert.equal(fresh, "fresh", "a post-mutation query must not inherit the old session request");
+  stale.resolve("stale");
+  assert.equal(await first, "stale");
+}
+
 // A stale answer is worse than a slow one: a failure must not be inherited.
 async function rejectionIsNotSharedOnward() {
   resetQueryCoalescing();
@@ -54,6 +74,8 @@ function onlyReadOnlyQueriesAreCoalesced() {
 const tests: Array<[string, () => unknown]> = [
   ["identical in-flight calls share one answer", identicalCallsInFlightShareOneAnswer],
   ["different arguments stay independent", differentArgumentsStayIndependent],
+  ["settled answers are not reused", settledAnswersAreNotReused],
+  ["mutations invalidate in-flight answers", mutationsInvalidateInflightAnswers],
   ["a rejection is not shared onward", rejectionIsNotSharedOnward],
   ["only read-only queries are coalesced", onlyReadOnlyQueriesAreCoalesced],
 ];
