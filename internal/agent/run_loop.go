@@ -8,13 +8,11 @@ import (
 	"strings"
 	"time"
 
-	"reasonix/internal/agentpreset"
 	"reasonix/internal/event"
 	"reasonix/internal/evidence"
 	"reasonix/internal/jobs"
 	"reasonix/internal/provider"
 	"reasonix/internal/taskintent"
-	"reasonix/internal/taskpolicy"
 	"reasonix/internal/tool"
 )
 
@@ -115,7 +113,7 @@ func (a *Agent) beginRunTurn(ctx context.Context, input string) (rawInput string
 	// A fresh user turn starts from zeroed per-turn host state; the new turn's
 	// values are computed below. Cross-turn state (checkpoint, scope, failure
 	// budgets) lives directly on Agent and is reconciled field by field.
-	a.perTurnState = perTurnState{turnInput: input}
+	a.perTurnState = perTurnState{}
 	a.resetStructuralRunGuards()
 	scope, scoped := DeliveryExecutionScopeFromContext(ctx)
 	preserveEvidence := a.preserveEvidenceOnce
@@ -180,61 +178,29 @@ func (a *Agent) beginRunTurn(ctx context.Context, input string) (rawInput string
 	// deadlocked read-only subagents. Without the override the raw input is
 	// classified verbatim: stripping user-controllable markup here would let
 	// input dressed up as host framing disarm the delivery gates.
-	classifierInput := a.classifierTaskText
+	a.turnInput = a.classifierTaskText
 	if scoped && strings.TrimSpace(scope.TaskText) != "" {
-		classifierInput = scope.TaskText
-	} else if strings.TrimSpace(classifierInput) == "" {
-		classifierInput = rawInput
+		a.turnInput = scope.TaskText
+	} else if strings.TrimSpace(a.turnInput) == "" {
+		a.turnInput = rawInput
 	}
-	intent := taskintent.Classify(classifierInput)
+	intent := taskintent.Classify(a.turnInput)
 	a.deliveryTaskExpected = intent.NeedsEvidence()
 	a.deliveryMutationExpected = intent == taskintent.Mutation && registryHasWriterTools(a.tools)
-	a.deliveryPersistentExpected = taskintent.NeedsPersistentAction(classifierInput)
-	a.recoveryTaskSummary = boundedRecoveryTaskSummary(classifierInput)
-	// Freeze TaskPolicy for this turn from the session role setting. Subsequent
-	// SetAgentPreset calls must not change this turn's route/review floor.
-	if policy, ok := taskpolicy.FromContext(ctx); ok {
-		a.turnPolicy = policy
-	} else {
-		a.turnPolicy = taskpolicy.Derive(taskpolicy.Input{
-			Raw:         classifierInput,
-			Instruction: taskpolicy.StripQuotedConstraints(classifierInput),
-			Preset:      agentpreset.AgentPreset(a.AgentPreset()),
-			PlanMode:    a.planMode.Load(),
-		})
-	}
-	a.turnPolicySet = true
-	// Align legacy delivery gates with the frozen role setting. Delivery always
-	// enables the full readiness contract. Light/Balanced only elevate when the
-	// turn is a mutation that requires forced review or is high-risk.
-	switch {
-	case a.AgentPreset() == string(agentpreset.Delivery):
-		a.deliveryProfile = true
-	case a.turnPolicy.Intent == taskintent.Mutation &&
-		(a.turnPolicy.RequiresIndependentReview() || a.turnPolicy.Risk >= taskpolicy.RiskHigh):
-		a.deliveryProfile = true
-	default:
-		a.deliveryProfile = false
-	}
+	a.deliveryPersistentExpected = taskintent.NeedsPersistentAction(a.turnInput)
+	a.recoveryTaskSummary = boundedRecoveryTaskSummary(a.turnInput)
 	// A cancelled/error turn leaves a provider-excluded recovery record at the
 	// transcript tail. Fold its bounded facts into this new user turn exactly
 	// once; the user's raw text remains the classifier source above.
 	providerInput = withInterruptedRecovery(providerInput, a.pendingInterruptedRecovery())
 	a.prepareRepeatFailureScope(scoped, scope.ID)
 	a.sink.Emit(event.Event{Kind: event.TurnStarted})
-	a.emitTurnPhase(event.TurnPhaseWorking)
 	input = a.withTurnPreferences(providerInput)
-	// Persist the short execution-policy block in provider Content; keep the
-	// original user text in RawContent for history/title/rewind stripping.
-	policyBlock := taskpolicy.ExecutionPolicyBlock(a.turnPolicy)
-	if !strings.Contains(input, "<execution-policy") {
-		input = strings.TrimSpace(input) + "\n\n" + policyBlock
-	}
 	userCreatedAt := time.Now().UnixMilli()
 	a.activeTurnCreatedAt.Store(userCreatedAt)
-	rawContent := rawInput
-	if rawContent == "" {
-		rawContent = classifierInput
+	rawContent := ""
+	if input != rawInput {
+		rawContent = rawInput
 	}
 	a.session.Add(provider.Message{
 		Role: provider.RoleUser, Content: input, RawContent: rawContent,
@@ -597,7 +563,7 @@ func (a *Agent) handleFinalResponse(ctx context.Context, state *runLoopState, te
 	if readiness.applies {
 		event.RecordReadinessAudit(a.sink, readiness.audit(evidence.ReadinessAllowed, a.readinessRecovered))
 	}
-	a.emitTurnShadows(state.input)
+	a.emitTurnShadows(a.turnInput)
 	if !a.closeSteerIntakeIfIdle() {
 		return true, nil
 	}
