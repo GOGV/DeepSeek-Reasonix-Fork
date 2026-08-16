@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"reasonix/internal/diff"
 	"reasonix/internal/provider"
@@ -284,60 +285,12 @@ type Registry struct {
 	order     []string
 	canon     map[string]json.RawMessage
 	suspended map[string]bool
-	// providerVisible, when non-nil, restricts Schemas/ContractEntries to the
-	// listed tool names. Get/Execute still resolve every registered tool so
-	// use_capability can dispatch tool:<name> without changing the provider
-	// schema. Nil means every registered tool is provider-visible (tests and
-	// legacy direct construction).
-	providerVisible map[string]bool
+	schemaRev atomic.Uint64
 }
 
 // NewRegistry returns an empty registry.
 func NewRegistry() *Registry {
 	return &Registry{tools: map[string]Tool{}, canon: map[string]json.RawMessage{}, suspended: map[string]bool{}}
-}
-
-// SetProviderVisibleTools restricts the provider-visible schema surface to the
-// given names while keeping all registered tools executable via Get. Passing
-// nil clears the restriction. Names are normalized with strings.TrimSpace.
-func (r *Registry) SetProviderVisibleTools(names []string) {
-	if r == nil {
-		return
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if names == nil {
-		r.providerVisible = nil
-		return
-	}
-	visible := make(map[string]bool, len(names))
-	for _, name := range names {
-		name = strings.TrimSpace(name)
-		if name != "" {
-			visible[name] = true
-		}
-	}
-	r.providerVisible = visible
-}
-
-// ProviderVisible reports whether name is currently provider-visible.
-func (r *Registry) ProviderVisible(name string) bool {
-	if r == nil {
-		return false
-	}
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	if r.providerVisible == nil {
-		return true
-	}
-	return r.providerVisible[strings.TrimSpace(name)]
-}
-
-func (r *Registry) isProviderVisibleLocked(name string) bool {
-	if r.providerVisible == nil {
-		return true
-	}
-	return r.providerVisible[name]
 }
 
 // Add inserts (or replaces) a tool, preserving first-seen order. The schema is
@@ -358,6 +311,7 @@ func (r *Registry) Add(t Tool) {
 	}
 	r.tools[name] = t
 	r.canon[name] = provider.CanonicalizeSchema(t.Schema())
+	r.schemaRev.Add(1)
 }
 
 // MCPNamePrefix is the namespace every MCP tool name carries: the
@@ -398,6 +352,9 @@ func (r *Registry) RemovePrefix(prefix string) int {
 		kept = append(kept, name)
 	}
 	r.order = kept
+	if removed > 0 {
+		r.schemaRev.Add(1)
+	}
 	return removed
 }
 
@@ -422,6 +379,9 @@ func (r *Registry) SuspendPrefix(prefix string) int {
 		kept = append(kept, name)
 	}
 	r.order = kept
+	if removed > 0 {
+		r.schemaRev.Add(1)
+	}
 	return removed
 }
 
@@ -564,6 +524,14 @@ func (r *Registry) Len() int {
 	return len(r.order)
 }
 
+// SchemaRevision changes whenever the provider-visible tool set changes.
+func (r *Registry) SchemaRevision() uint64 {
+	if r == nil {
+		return 0
+	}
+	return r.schemaRev.Load()
+}
+
 // Names returns the registered tool names in insertion order.
 func (r *Registry) Names() []string {
 	r.mu.RLock()
@@ -575,17 +543,12 @@ func (r *Registry) Names() []string {
 }
 
 // Schemas exports tool definitions in stable name order for the provider.
-// When a provider-visible allowlist is set, only those tools appear.
 func (r *Registry) Schemas() []provider.ToolSchema {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	names := make([]string, 0, len(r.order))
-	for _, name := range r.order {
-		if r.isProviderVisibleLocked(name) {
-			names = append(names, name)
-		}
-	}
+	names := make([]string, len(r.order))
+	copy(names, r.order)
 	sort.Strings(names)
 
 	out := make([]provider.ToolSchema, 0, len(names))
@@ -600,16 +563,6 @@ func (r *Registry) Schemas() []provider.ToolSchema {
 			Parameters:  r.canon[name],
 		})
 	}
-	return out
-}
-
-// AllNames returns every registered tool name, including tools hidden from the
-// provider-visible schema. Used by capability catalogs and diagnostics.
-func (r *Registry) AllNames() []string {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	out := make([]string, len(r.order))
-	copy(out, r.order)
 	return out
 }
 
