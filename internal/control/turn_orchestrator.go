@@ -27,6 +27,7 @@ type turnOrchestrator struct {
 type orchestratedTurn struct {
 	input            string
 	raw              string
+	imageRefs        string
 	display          string
 	editedOriginal   string
 	synthetic        bool
@@ -41,8 +42,16 @@ func (o *turnOrchestrator) runTurnWithRawDisplay(ctx context.Context, input, raw
 	return o.runOrchestratedTurn(ctx, orchestratedTurn{input: input, raw: raw, display: display})
 }
 
+func (o *turnOrchestrator) runTurnWithImageRefsRawDisplay(ctx context.Context, input, raw, imageRefs, display string) error {
+	return o.runOrchestratedTurn(ctx, orchestratedTurn{input: input, raw: raw, imageRefs: imageRefs, display: display})
+}
+
 func (o *turnOrchestrator) runEditedTurnWithRawDisplay(ctx context.Context, input, raw, display, original string) error {
 	return o.runOrchestratedTurn(ctx, orchestratedTurn{input: input, raw: raw, display: display, editedOriginal: original})
+}
+
+func (o *turnOrchestrator) runEditedTurnWithImageRefsRawDisplay(ctx context.Context, input, raw, imageRefs, display, original string) error {
+	return o.runOrchestratedTurn(ctx, orchestratedTurn{input: input, raw: raw, imageRefs: imageRefs, display: display, editedOriginal: original})
 }
 
 func (o *turnOrchestrator) runSyntheticTurnWithRawDisplay(ctx context.Context, input, raw, display string) error {
@@ -110,17 +119,17 @@ func (o *turnOrchestrator) runSubagentSkillTurns(ctx context.Context, skills []s
 	c := o.c
 	c.maybeSessionStart(ctx)
 	parentSession := c.parentSessionID()
-	images := c.inputImages(raw)
+	images, imageCandidates := c.resolveTurnImages(raw)
 	ctx = agent.WithParentSession(ctx, parentSession)
 	ctx = jobs.WithSession(ctx, parentSession)
 	ctx = agent.WithUserImages(ctx, images)
+	ctx = agent.WithSubagentImageCandidates(ctx, imageCandidates)
 	ctx = agent.WithResponseLanguagePreference(ctx, c.responseLanguage)
 	ctx = agent.WithReasoningLanguagePreference(ctx, c.reasoningLanguage)
 
 	input := c.compose(task, raw, true)
 	startMessages := c.messageCount()
-	var marker agent.InFlightTurnMeta
-	defer func() { c.finishInFlightTurn(startMessages, marker) }()
+	defer c.snapshotActivityIfChanged(startMessages)
 	defer c.recordDisplayForNewUser(startMessages, display)
 	// The checkpoint prompt labels the turn in the rewind picker (and is
 	// prefilled into the composer after a conversation rewind), so it must be
@@ -141,7 +150,13 @@ func (o *turnOrchestrator) runSubagentSkillTurns(ctx context.Context, skills []s
 		defer func() { c.hooks.StopResult(context.Background(), lastAssistantText(c.History()), turn, err) }()
 	}
 
-	marker = c.markInFlightTurn(startMessages, true)
+	c.markInFlightTurn(startMessages, true)
+	inFlight := true
+	defer func() {
+		if inFlight {
+			c.clearInFlightTurn()
+		}
+	}()
 	c.sink.Emit(event.Event{Kind: event.TurnStarted})
 	if c.executor == nil {
 		return fmt.Errorf("subagent slash invocation requires an active session")
@@ -179,6 +194,8 @@ func (o *turnOrchestrator) runSubagentSkillTurns(ctx context.Context, skills []s
 		c.sink.Emit(event.Event{Kind: event.Message, Text: display})
 	}
 
+	c.clearInFlightTurn()
+	inFlight = false
 	return nil
 }
 
@@ -188,8 +205,9 @@ func (o *turnOrchestrator) runOrchestratedTurn(ctx context.Context, turn orchest
 	parentSession := c.parentSessionID()
 	ctx = agent.WithParentSession(ctx, parentSession)
 	ctx = jobs.WithSession(ctx, parentSession)
-	userImages := c.inputImages(turn.input)
+	userImages, imageCandidates := c.resolveTurnImages(turn.imageReferenceInput())
 	ctx = agent.WithUserImages(ctx, userImages)
+	ctx = agent.WithSubagentImageCandidates(ctx, imageCandidates)
 	ctx = agent.WithRawUserInput(ctx, turn.raw)
 	continuation := turn.goalContinuation
 	var input string
@@ -219,8 +237,7 @@ func (o *turnOrchestrator) runOrchestratedTurn(ctx context.Context, turn orchest
 		return nil
 	}
 	startMessages := c.messageCount()
-	var marker agent.InFlightTurnMeta
-	defer func() { c.finishInFlightTurn(startMessages, marker) }()
+	defer c.snapshotActivityIfChanged(startMessages)
 	defer c.recordDisplayForNewUser(startMessages, turn.display)
 	if turn.editedOriginal != "" {
 		defer c.markEditedForNewUser(startMessages, turn.editedOriginal)
@@ -252,7 +269,7 @@ func (o *turnOrchestrator) runOrchestratedTurn(ctx context.Context, turn orchest
 		}
 		defer func() { c.hooks.StopResult(context.Background(), lastAssistantText(c.History()), turn, err) }()
 	}
-	marker = c.markInFlightTurn(startMessages, !turn.synthetic && !IsSyntheticUserMessage(turn.raw))
+	c.markInFlightTurn(startMessages, !turn.synthetic && !IsSyntheticUserMessage(turn.raw))
 	var autoResearchTaskID string
 	if continuation != nil {
 		autoResearchTaskID = continuation.autoResearchTaskID
@@ -300,6 +317,7 @@ func (o *turnOrchestrator) runOrchestratedTurn(ctx context.Context, turn orchest
 		c.autoResearch.recordEvidenceFromAssistant(autoResearchTaskID, assistantText)
 		c.autoResearch.recordTurnProgress(autoResearchTaskID, autoResearchAcceptedBefore, assistantText)
 		c.autoResearch.heartbeat(autoResearchTaskID, autoresearch.HeartbeatTurnDone, "")
+		c.clearInFlightTurn()
 	} else {
 		c.autoResearch.heartbeat(autoResearchTaskID, autoresearch.HeartbeatWarning, err.Error())
 		// When the user explicitly cancels, keep the real prompt and any fully
@@ -330,6 +348,7 @@ func (o *turnOrchestrator) runOrchestratedTurn(ctx context.Context, turn orchest
 				CreatedAt: time.Now().UnixMilli(),
 			})
 		}
+		c.clearInFlightTurn()
 		return err
 	}
 	c.mu.Lock()
@@ -365,8 +384,8 @@ func (o *turnOrchestrator) runOrchestratedTurn(ctx context.Context, turn orchest
 	c.approval.setPlanAutoApprove(true)
 	defer c.approval.setPlanAutoApprove(false)
 	err = func() error {
-		marker := c.markInFlightTurn(execStart, false)
-		defer c.finishInFlightTurn(execStart, marker)
+		c.markInFlightTurn(execStart, false)
+		defer c.clearInFlightTurn()
 		return o.runComposedSyntheticTurn(ctx, planApprovedMessage)
 	}()
 	if err != nil {
@@ -382,8 +401,12 @@ func (o *turnOrchestrator) runOrchestratedTurn(ctx context.Context, turn orchest
 }
 
 func (o *turnOrchestrator) runGoalLoopWithRawDisplay(ctx context.Context, input, raw, display string) error {
+	return o.runGoalLoopWithImageRefsRawDisplay(ctx, input, raw, "", display)
+}
+
+func (o *turnOrchestrator) runGoalLoopWithImageRefsRawDisplay(ctx context.Context, input, raw, imageRefs, display string) error {
 	expectedContinuationEpoch := o.c.goals.continuationToken()
-	err := o.runTurnWithRawDisplay(ctx, input, raw, display)
+	err := o.runTurnWithImageRefsRawDisplay(ctx, input, raw, imageRefs, display)
 	if err != nil {
 		if ctx.Err() != nil {
 			o.c.goalUsageTee.setActiveRecorder(nil)
@@ -406,8 +429,12 @@ func (o *turnOrchestrator) runGoalLoopWithRawDisplay(ctx context.Context, input,
 }
 
 func (o *turnOrchestrator) runEditedGoalLoopWithRawDisplay(ctx context.Context, input, raw, display, original string) error {
+	return o.runEditedGoalLoopWithImageRefsRawDisplay(ctx, input, raw, "", display, original)
+}
+
+func (o *turnOrchestrator) runEditedGoalLoopWithImageRefsRawDisplay(ctx context.Context, input, raw, imageRefs, display, original string) error {
 	expectedContinuationEpoch := o.c.goals.continuationToken()
-	err := o.runEditedTurnWithRawDisplay(ctx, input, raw, display, original)
+	err := o.runEditedTurnWithImageRefsRawDisplay(ctx, input, raw, imageRefs, display, original)
 	if err != nil {
 		if ctx.Err() != nil {
 			o.c.goalUsageTee.setActiveRecorder(nil)
