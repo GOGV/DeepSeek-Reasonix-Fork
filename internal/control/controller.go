@@ -115,13 +115,12 @@ type Controller struct {
 	// skills owns the session's discovered skills (enabled subset, full set, and
 	// the reloadable stores) — the skills slice of the Capabilities concern. See
 	// skill.go.
-	skills                         skillSet
-	skillRunner                    skill.SubagentRunner
-	readOnlySkillRunner            skill.SubagentRunner
-	skillProfile                   skill.ProfileResolver
-	disableImplicitSkillInvocation bool
-	slashSkillSeq                  atomic.Uint64
-	hooks                          *hook.Runner // session hook runner; nil-safe (no hooks configured)
+	skills              skillSet
+	skillRunner         skill.SubagentRunner
+	readOnlySkillRunner skill.SubagentRunner
+	skillProfile        skill.ProfileResolver
+	slashSkillSeq       atomic.Uint64
+	hooks               *hook.Runner // session hook runner; nil-safe (no hooks configured)
 	// hookContexts carries one-shot lifecycle hook context into the next real
 	// user turn without changing the cache-stable system prompt.
 	hookContexts []string
@@ -443,9 +442,6 @@ type Options struct {
 	AllSkills     []skill.Skill
 	SkillStore    *skill.Store
 	AllSkillStore *skill.Store
-	// DisableImplicitSkillInvocation controls model-facing discovery only;
-	// explicit /skill commands and management remain host-side capabilities.
-	DisableImplicitSkillInvocation bool
 	// SkillRunner executes a runAs=subagent skill in an isolated child loop.
 	// ReadOnlySkillRunner is reserved for explicitly read-only entry points;
 	// Plan itself is a workflow instruction and uses SkillRunner with the shared
@@ -589,7 +585,6 @@ func New(opts Options) *Controller {
 		sessionPath:                       opts.SessionPath,
 		commands:                          atomic.Pointer[[]command.Command]{},
 		skills:                            newSkillSet(opts.Skills, opts.AllSkills, opts.SkillStore, opts.AllSkillStore),
-		disableImplicitSkillInvocation:    opts.DisableImplicitSkillInvocation,
 		skillRunner:                       opts.SkillRunner,
 		readOnlySkillRunner:               opts.ReadOnlySkillRunner,
 		skillProfile:                      opts.SkillProfile,
@@ -872,36 +867,12 @@ func (c *Controller) rebindCheckpoints(sessionPath string) {
 	}
 }
 
-// beginCheckpoint opens a checkpoint for the turn about to run, recording the
-// current message count as the conversation-rewind boundary. Called at the top of
-// runTurn, before the user message is appended.
-func (c *Controller) beginCheckpoint(input string) {
-	if c.executor == nil {
-		return
-	}
-	atomic.AddInt64(&c.sessionRevision, 1)
-	c.checkpoints.beginWithObserver(input, len(c.executor.Session().Messages), c.mutationObserver)
-	// User-visible turn start records an irreversible message-send receipt so
-	// recovery never claims a clean rollback of already-committed prompts.
-	gen := c.RuntimeGeneration()
-	if gen == 0 {
-		gen = c.RuntimeOwner().Gate.Published()
-	}
-	msgID := fmt.Sprintf("turn-%d-%d", gen, atomic.LoadInt64(&c.sessionRevision))
-	// Dedup: a retried turn with the same revision must not double-record.
-	owner := c.RuntimeOwner()
-	owner.RecordMessageSentOnce(gen, msgID, "control")
-	d := owner.DecideResume(gen)
-	c.mu.Lock()
-	c.lastResumeDecision = d
-	c.mu.Unlock()
-}
-
 // commands (frontend → controller)
 
 // spawnGuardedTurn launches an admitted turn body plus its autosave companion.
 // The caller must already have claimed admission (running=true) under c.mu.
 func (c *Controller) spawnGuardedTurn(ctx context.Context, cancel context.CancelFunc, body func(ctx context.Context) error) {
+	ctx, completion := withGuardedTurnCompletion(ctx)
 	c.autosaveWG.Go(func() {
 		c.autosaveWhileRunning(ctx)
 	})
@@ -909,11 +880,11 @@ func (c *Controller) spawnGuardedTurn(ctx context.Context, cancel context.Cancel
 		defer cancel()
 		defer func() {
 			if r := recover(); r != nil {
-				c.finishGuardedTurn(fmt.Errorf("internal error: %v", r))
+				c.finishGuardedTurn(fmt.Errorf("internal error: %v", r), completion)
 			}
 		}()
 		err := body(ctx)
-		c.finishGuardedTurn(explainError(err))
+		c.finishGuardedTurn(explainError(err), completion)
 	}()
 }
 
@@ -929,7 +900,7 @@ func (c *Controller) spawnGuardedTurn(ctx context.Context, cancel context.Cancel
 // finishGuardedTurn, preserving FIFO order. Rotation cannot interleave here:
 // beginRotation refuses while running or finishing, and the drain flips
 // finishing directly into running.
-func (c *Controller) finishGuardedTurn(err error) {
+func (c *Controller) finishGuardedTurn(err error, completion *guardedTurnCompletion) {
 	c.memory.clearAutoRemember()
 	c.mu.Lock()
 	cancelRequested := c.canceling
@@ -961,7 +932,7 @@ func (c *Controller) finishGuardedTurn(err error) {
 		c.mu.Unlock()
 		c.spawnGuardedTurn(ctx, cancel, next)
 	}()
-	done := event.Event{Kind: event.TurnDone, Err: err, Cancelled: cancelRequested, Outcome: turnOutcome(err)}
+	done := event.Event{Kind: event.TurnDone, Err: err, Cancelled: cancelRequested, Outcome: turnOutcome(err), CheckpointTurn: c.validatedCheckpointTurn(completion)}
 	var readinessErr *agent.FinalReadinessError
 	if errors.As(err, &readinessErr) {
 		done.Readiness = &event.FinalReadiness{Attempts: readinessErr.Attempts, Missing: append([]string(nil), readinessErr.Missing...)}
@@ -1895,9 +1866,9 @@ func (c *Controller) runRefTurnWithResolverSync(ctx context.Context, input, refL
 		sent = "Referenced context:\n\n" + block + "\n\n" + input
 	}
 	if strings.TrimSpace(original) != "" {
-		return c.runEditedGoalLoopWithImageRefsRawDisplay(ctx, sent, input, refLine, display, original)
+		return c.runEditedGoalLoopWithRawDisplay(ctx, sent, input, display, original)
 	}
-	return c.runGoalLoopWithImageRefsRawDisplay(ctx, sent, input, refLine, display)
+	return c.runGoalLoopWithRawDisplay(ctx, sent, input, display)
 }
 
 // notice emits an informational Notice event.
@@ -1923,8 +1894,8 @@ func (c *Controller) Run(ctx context.Context, input string) (err error) {
 	parentSession := c.parentSessionID()
 	ctx = agent.WithParentSession(ctx, parentSession)
 	ctx = jobs.WithSession(ctx, parentSession)
+	ctx = agent.WithUserImages(ctx, c.inputImages(input))
 	rawInput := input
-	ctx = c.withTurnImages(ctx, rawInput)
 	ctx = agent.WithRawUserInput(ctx, rawInput)
 	input = c.Compose(input)
 	// input.receive: same interception seam as the orchestrated turn — the
@@ -1938,9 +1909,8 @@ func (c *Controller) Run(ctx context.Context, input string) (err error) {
 		return nil
 	}
 	startMessages := c.messageCount()
-	var marker agent.InFlightTurnMeta
-	defer func() { c.finishInFlightTurn(startMessages, marker) }()
-	c.beginCheckpoint(input)
+	defer c.snapshotActivityIfChanged(startMessages)
+	c.beginCheckpoint(ctx, input)
 	if c.guardianSess != nil {
 		c.guardianSess.ResetTurn()
 	}
@@ -1954,7 +1924,8 @@ func (c *Controller) Run(ctx context.Context, input string) (err error) {
 		}
 		defer func() { c.hooks.StopResult(context.Background(), lastAssistantText(c.History()), turn, err) }()
 	}
-	marker = c.markInFlightTurn(startMessages, true)
+	c.markInFlightTurn(startMessages, true)
+	defer c.clearInFlightTurn()
 	ctx = c.withPlannerTurnMetadata(ctx, rawInput, false, startMessages)
 	err = c.runner.Run(ctx, c.withCapabilityRoute(ctx, input, rawInput))
 	return err
@@ -1994,7 +1965,7 @@ func (c *Controller) RunSubagentProfile(ctx context.Context, name, task string, 
 	parentSession := c.parentSessionID()
 	ctx = agent.WithParentSession(ctx, parentSession)
 	ctx = jobs.WithSession(ctx, parentSession)
-	ctx = c.withTurnImages(ctx, task)
+	ctx = agent.WithUserImages(ctx, c.inputImages(task))
 	ctx = agent.WithResponseLanguagePreference(ctx, c.responseLanguage)
 	ctx = agent.WithReasoningLanguagePreference(ctx, c.reasoningLanguage)
 	ctx = agent.WithSubagentDepth(ctx, 0)
@@ -2837,8 +2808,10 @@ func (c *Controller) Compact(ctx context.Context, instructions string) error {
 	if c.executor == nil {
 		return nil
 	}
-	// The rotation gate keeps a turn from starting while a manual compaction is
-	// building and installing a new model-visible projection.
+	// The run loop is the only sanctioned writer of the live session during a
+	// turn; a manual compact would rewrite the log underneath it. The rotation
+	// gate (not a bare Running() check) also blocks a turn from starting while
+	// the compaction rewrites the session — see beginRotation.
 	if err := c.beginRotation(); err != nil {
 		if errors.Is(err, errTurnRunningRotation) {
 			return fmt.Errorf("cannot compact while a turn is running")
@@ -3421,9 +3394,12 @@ func branchDisplayName(b agent.BranchInfo) string {
 	return b.ID
 }
 
-// SummarizeFrom and SummarizeUpTo preserve the historical turn-index API while
-// changing only the model-visible context projection. The canonical transcript
-// and checkpoint boundaries remain available for rewind, undo, and fork.
+// SummarizeFrom compresses the conversation from turn onward into one summary;
+// SummarizeUpTo compresses everything before it. Both are Claude Code's "summarize
+// from/up to here" — they restructure the message log (keeping code untouched), so
+// afterwards the per-turn boundaries no longer map and conversation rewind/fork
+// report "unavailable" until new turns rebuild them (code rewind, file-based, is
+// unaffected). Refused while a turn runs; need the live boundary.
 func (c *Controller) SummarizeFrom(ctx context.Context, turn int) error {
 	return c.summarizeAt(ctx, turn, true)
 }
@@ -3436,9 +3412,10 @@ func (c *Controller) summarizeAt(ctx context.Context, turn int, from bool) error
 	if c.executor == nil {
 		return c.rewindFail(fmt.Errorf("checkpoints unavailable"))
 	}
-	// Hold the rotation gate from the checkpoint-boundary lookup through
-	// projection installation so a turn cannot start against an intermediate
-	// context view.
+	// Summarize rewrites the live session AFTER a provider round-trip, so the
+	// bare Running() check left a seconds-wide window for a turn to start and
+	// then have the log replaced under it. Hold the rotation gate from the
+	// boundary read through the post-rewrite snapshot.
 	if err := c.beginRotation(); err != nil {
 		if errors.Is(err, errTurnRunningRotation) {
 			return c.rewindFail(fmt.Errorf("cannot summarize while a turn is running"))
@@ -3458,6 +3435,14 @@ func (c *Controller) summarizeAt(ctx context.Context, turn int, from bool) error
 	}
 	if err != nil {
 		return c.rewindFail(err)
+	}
+	// The log was restructured; existing boundaries no longer map. Drop them (keep
+	// the turn counter monotonic so new turns don't collide with the store) —
+	// conversation rewind degrades to "unavailable" until fresh turns rebuild them.
+	c.checkpoints.clearBounds()
+	atomic.AddInt64(&c.sessionRevision, 1)
+	if err := c.SnapshotRewrite(); err != nil {
+		slog.Warn("controller: post-summarize snapshot", "err", err)
 	}
 	return nil
 }
@@ -3613,11 +3598,6 @@ func (c *Controller) SnapshotRewrite() error {
 	return c.snapshot(false, true, false)
 }
 
-func (c *Controller) snapshot(markActivity, forceRewrite, shutdownRecovery bool) error {
-	_, err := c.snapshotWithDurability(markActivity, forceRewrite, shutdownRecovery)
-	return err
-}
-
 // midTurnSnapshotInterval is atomic (nanoseconds) so a test shrinking it
 // cannot race a previous test's still-parking autosave goroutine.
 var midTurnSnapshotInterval atomic.Int64
@@ -3643,11 +3623,7 @@ func (c *Controller) autosaveWhileRunning(ctx context.Context) {
 	}
 }
 
-// snapshotWithDurability reports whether the canonical transcript reached disk
-// even when a later sidecar update failed. Callers that guard a crash marker
-// need this distinction: a metadata error must not make a complete transcript
-// look like an in-memory-only turn.
-func (c *Controller) snapshotWithDurability(markActivity, forceRewrite, shutdownRecovery bool) (bool, error) {
+func (c *Controller) snapshot(markActivity, forceRewrite, shutdownRecovery bool) error {
 	c.snapshotMu.Lock()
 	defer c.snapshotMu.Unlock()
 
@@ -3656,13 +3632,13 @@ func (c *Controller) snapshotWithDurability(markActivity, forceRewrite, shutdown
 	modelRef := c.modelRef
 	c.mu.Unlock()
 	if c.executor == nil {
-		return false, nil
+		return nil
 	}
 	s := c.executor.Session()
 	if !s.HasContent() {
 		// Nothing to persist yet (e.g. a fresh session with only a system
 		// prompt) — staying quiet here is correct, not a data-loss path.
-		return false, nil
+		return nil
 	}
 	if !s.HasSystemMessage() {
 		// The session has user/assistant/tool messages but no leading system
@@ -3674,7 +3650,7 @@ func (c *Controller) snapshotWithDurability(markActivity, forceRewrite, shutdown
 		// diagnosed, then refuse to write a corrupted transcript.
 		slog.Warn("controller: refusing to snapshot session with content but no system message",
 			"label", c.Label(), "session_dir", c.SessionDir(), "message_count", len(s.Snapshot()))
-		return false, nil
+		return nil
 	}
 	if path == "" {
 		// There IS content but nowhere to write it: this silently dropped whole
@@ -3682,7 +3658,7 @@ func (c *Controller) snapshotWithDurability(markActivity, forceRewrite, shutdown
 		// so the missing session path can be diagnosed and fixed at the source.
 		slog.Warn("controller: session has content but no session path; conversation will not be persisted",
 			"label", c.Label(), "session_dir", c.SessionDir())
-		return false, errNoSessionPath
+		return errNoSessionPath
 	}
 	// session.save: the session_policy owner rules on the impending save; a
 	// failure (required-class) vetoes the write. The event goes out after a
@@ -3692,7 +3668,7 @@ func (c *Controller) snapshotWithDurability(markActivity, forceRewrite, shutdown
 	// the save targeted.
 	savePayload, strategyErr := c.extensionSessionStrategy(context.Background(), extension.PointSessionSave, dispatch.PhaseSave, path)
 	if strategyErr != nil {
-		return false, strategyErr
+		return strategyErr
 	}
 	forceRewrite = forceRewrite || s.NeedsRewriteSave()
 	var err error
@@ -3715,7 +3691,7 @@ func (c *Controller) snapshotWithDurability(markActivity, forceRewrite, shutdown
 		if shutdownRecovery && errors.Is(err, agent.ErrSessionFileLockHeld) {
 			recoveredPath, recoverErr := c.recoverShutdownSnapshot(path, err)
 			if recoverErr != nil {
-				return false, recoverErr
+				return recoverErr
 			}
 			path = recoveredPath
 			s = c.executor.Session()
@@ -3724,23 +3700,23 @@ func (c *Controller) snapshotWithDurability(markActivity, forceRewrite, shutdown
 	}
 	if err != nil {
 		if !errors.Is(err, agent.ErrSessionSnapshotConflict) {
-			return false, err
+			return err
 		}
 		recoveredPath, outcome, recoverErr := c.recoverSnapshotConflict(path, err, forceRewrite)
 		if recoverErr != nil {
 			if shutdownRecovery && errors.Is(recoverErr, agent.ErrSessionFileLockHeld) {
 				recoveredPath, recoverErr = c.recoverShutdownSnapshot(path, recoverErr)
 				if recoverErr != nil {
-					return false, recoverErr
+					return recoverErr
 				}
 				path = recoveredPath
 				s = c.executor.Session()
 			} else {
-				return false, recoverErr
+				return recoverErr
 			}
 		} else {
 			if outcome == conflictDropped {
-				return false, nil
+				return nil
 			}
 			// Whatever recovery did — adopted the disk transcript, force-saved
 			// the depth-capped branch, or forked — the rewrite baseline lives on
@@ -3759,7 +3735,6 @@ func (c *Controller) snapshotWithDurability(markActivity, forceRewrite, shutdown
 			}
 		}
 	}
-	transcriptDurable := true
 	// Persist recovery gate state so unresolved checkpoints survive restart.
 	c.saveRecoveryState(path)
 	// Record the listing-only sidecar fields (model, preview, user-turn count)
@@ -3770,10 +3745,10 @@ func (c *Controller) snapshotWithDurability(markActivity, forceRewrite, shutdown
 	// EnsureBranchMeta / SetBranchModel / TouchBranchMeta sequence.
 	preview, turns := agent.SessionPreviewFromMessages(s.Snapshot())
 	if err := agent.UpdateSessionMeta(path, modelRef, preview, turns, markActivity); err != nil {
-		return transcriptDurable, err
+		return err
 	}
 	c.extensionSessionPayloadEvent(extension.PointSessionSave, savePayload)
-	return transcriptDurable, nil
+	return nil
 }
 
 // snapshotConflictLogAttrs flattens a snapshot-conflict error into slog attrs.
@@ -4048,62 +4023,24 @@ func (c *Controller) messageCount() int {
 	return c.executor.Session().Len()
 }
 
-func (c *Controller) markInFlightTurn(startMessageIndex int, preserveUser bool) agent.InFlightTurnMeta {
+func (c *Controller) markInFlightTurn(startMessageIndex int, preserveUser bool) {
 	path := c.SessionPath()
 	if path == "" {
-		return agent.InFlightTurnMeta{}
-	}
-	marker, err := agent.BeginSessionInFlightTurn(path, startMessageIndex, preserveUser)
-	if err != nil {
-		slog.Warn("controller: mark in-flight turn", "err", err)
-		return agent.InFlightTurnMeta{}
-	}
-	return marker
-}
-
-func (c *Controller) clearInFlightTurn(marker agent.InFlightTurnMeta) {
-	path := c.SessionPath()
-	if path == "" || marker.ID == "" {
 		return
 	}
-	if _, err := agent.ClearSessionInFlightTurnIfMatch(path, marker); err != nil {
+	if err := agent.MarkSessionInFlightTurn(path, startMessageIndex, preserveUser); err != nil {
+		slog.Warn("controller: mark in-flight turn", "err", err)
+	}
+}
+
+func (c *Controller) clearInFlightTurn() {
+	path := c.SessionPath()
+	if path == "" {
+		return
+	}
+	if err := agent.ClearSessionInFlightTurn(path); err != nil {
 		slog.Warn("controller: clear in-flight turn", "err", err)
 	}
-}
-
-// finishInFlightTurn persists the completed transcript before removing the
-// crash marker. A crash can therefore leave either a recoverable marker or a
-// durable completed transcript, never an unmarked in-memory-only suffix.
-func (c *Controller) finishInFlightTurn(startMessages int, marker agent.InFlightTurnMeta) {
-	commitPrepared := marker.ID == ""
-	if marker.ID != "" && c.executor != nil {
-		digest, digestErr := c.executor.Session().ContentDigest()
-		if digestErr != nil {
-			slog.Warn("controller: compute completed turn digest", "err", digestErr)
-		} else if prepared, matched, prepareErr := agent.PrepareSessionInFlightTurnCommit(c.SessionPath(), marker, digest); prepareErr != nil {
-			slog.Warn("controller: prepare in-flight turn commit", "err", prepareErr)
-		} else if matched {
-			marker = prepared
-			commitPrepared = true
-		}
-	}
-	durable, err := c.snapshotActivityIfChanged(startMessages)
-	if err != nil && !durable {
-		// Keep the marker when the transcript did not become durable. Resume can
-		// then retry recovery instead of treating an in-memory-only tail as done.
-		slog.Warn("controller: keeping in-flight marker after failed turn snapshot", "err", err)
-		return
-	}
-	if err != nil {
-		slog.Warn("controller: turn transcript saved before metadata update failed", "err", err)
-	}
-	if !commitPrepared {
-		// Do not clear an unprepared marker: a crash between the snapshot and this
-		// point would otherwise leave recovery without exact commit evidence.
-		slog.Warn("controller: keeping in-flight marker without commit digest", "marker_id", marker.ID)
-		return
-	}
-	c.clearInFlightTurn(marker)
 }
 
 // transplantInFlightTurnMarker moves a pending in-flight-turn marker from the
@@ -4130,7 +4067,7 @@ func (c *Controller) transplantInFlightTurnMarker(fromPath, toPath string) {
 		slog.Warn("controller: transplant in-flight turn marker", "path", toPath, "err", err)
 		return
 	}
-	if _, err := agent.ClearSessionInFlightTurnIfMatch(fromPath, *marker); err != nil {
+	if err := agent.ClearSessionInFlightTurn(fromPath); err != nil {
 		slog.Warn("controller: clear in-flight turn marker on forked-from branch", "path", fromPath, "err", err)
 	}
 }
@@ -4154,36 +4091,13 @@ func (c *Controller) recoverInterruptedTurn(path string) {
 		// transplant in recoverSnapshotConflict left the marker behind on the
 		// forked-from branch; stripping now would truncate a transcript the
 		// completed turn already superseded. Clear the stale marker instead.
-		if _, err := agent.ClearSessionInFlightTurnIfMatch(path, *marker); err != nil {
+		if err := agent.ClearSessionInFlightTurn(path); err != nil {
 			slog.Warn("controller: clear fork-orphaned in-flight turn", "err", err)
 		}
 		return
 	}
 	msgs := c.executor.Session().Snapshot()
-	if marker.CommitDigest != "" {
-		if digest, digestErr := c.executor.Session().ContentDigest(); digestErr != nil {
-			slog.Warn("controller: digest resumed in-flight turn", "err", digestErr)
-		} else if digest == marker.CommitDigest {
-			// The exact transcript named before the final snapshot is present. The
-			// process died after commit and before CAS cleanup; preserve everything.
-			if _, err := agent.ClearSessionInFlightTurnIfMatch(path, *marker); err != nil {
-				slog.Warn("controller: clear committed in-flight turn marker", "err", err)
-			}
-			return
-		}
-	}
 	start, found := resolveInterruptedTurnStart(msgs, marker.StartMessageIndex, marker.PreserveUser, marker.StartedAt, provider.Message{})
-	if found && interruptedTurnCrossesLaterTurn(msgs, start) {
-		slog.Warn("controller: preserving WAL transcript after stale in-flight marker",
-			"path", path, "messages", len(msgs), "marker_index", marker.StartMessageIndex, "resolved_index", start,
-			"marker_revision", marker.StartRevision, "current_revision", meta.Revision)
-		c.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelWarn,
-			Text: "Session recovery found completed turns after a stale interruption marker; the full WAL history was preserved."})
-		if _, err := agent.ClearSessionInFlightTurnIfMatch(path, *marker); err != nil {
-			slog.Warn("controller: clear stale multi-turn in-flight marker", "err", err)
-		}
-		return
-	}
 	changed := found && len(msgs) > start
 	if changed {
 		if marker.PreserveUser {
@@ -4195,32 +4109,9 @@ func (c *Controller) recoverInterruptedTurn(path string) {
 			slog.Warn("controller: post-interrupted-turn snapshot", "err", err)
 		}
 	}
-	if _, err := agent.ClearSessionInFlightTurnIfMatch(path, *marker); err != nil {
+	if err := agent.ClearSessionInFlightTurn(path); err != nil {
 		slog.Warn("controller: clear stale in-flight turn", "err", err)
 	}
-}
-
-// interruptedTurnCrossesLaterTurn detects the data-loss shape where an old
-// marker survived while one or more later turns were durably appended. A
-// compaction summary and mid-turn steer are not new foreground turn boundaries.
-func interruptedTurnCrossesLaterTurn(msgs []provider.Message, start int) bool {
-	if start < 0 || start >= len(msgs) {
-		return false
-	}
-	turns := 0
-	for _, msg := range msgs[start:] {
-		if msg.Role != provider.RoleUser || agent.IsCompactionSummary(msg) {
-			continue
-		}
-		if _, ok := agent.SteerText(msg.Content); ok {
-			continue
-		}
-		turns++
-		if turns > 1 {
-			return true
-		}
-	}
-	return false
 }
 
 // interruptedTurnContinuedOnRecoveryBranch reports whether a recovery branch
@@ -4625,11 +4516,13 @@ func (c *Controller) replaceSessionAfterCancel(msgs []provider.Message) {
 	}
 }
 
-func (c *Controller) snapshotActivityIfChanged(startMessages int) (bool, error) {
+func (c *Controller) snapshotActivityIfChanged(startMessages int) {
 	if c.messageCount() <= startMessages {
-		return true, nil
+		return
 	}
-	return c.snapshotWithDurability(true, false, false)
+	if err := c.SnapshotActivity(); err != nil {
+		slog.Warn("controller: activity snapshot", "err", err)
+	}
 }
 
 // SetSessionPath rebinds auto-save without changing the current session
@@ -4745,34 +4638,6 @@ func (c *Controller) History() []provider.Message {
 		return nil
 	}
 	return c.executor.Session().Snapshot() // copy — a turn may be appending concurrently
-}
-
-// HistoryLen returns the number of messages in the live log.
-func (c *Controller) HistoryLen() int {
-	if c.executor == nil {
-		return 0
-	}
-	return c.executor.Session().Len()
-}
-
-// HistoryWindow returns a copy of the messages in [start, end) of the live
-// log. Paging frontends use it to convert a display window without copying
-// the whole history.
-func (c *Controller) HistoryWindow(start, end int) []provider.Message {
-	if c.executor == nil {
-		return []provider.Message{}
-	}
-	return c.executor.Session().MessageRange(start, end)
-}
-
-// SessionPersistedState exposes the session's persistence baseline for the
-// controller's current session path, so a paging frontend can validate a
-// display-index sidecar against the live session.
-func (c *Controller) SessionPersistedState() (agent.PersistedState, bool) {
-	if c.executor == nil {
-		return agent.PersistedState{}, false
-	}
-	return c.executor.Session().PersistedState(c.SessionPath())
 }
 
 // ContextSnapshot returns (usedTokens, contextWindow) from the most recent
@@ -4905,10 +4770,7 @@ func (c *Controller) ReloadCommands(ctx context.Context) error {
 	default:
 	}
 	cmds, loadErr := command.LoadRoots(config.CommandRootsForRoot(c.workspaceRoot)...)
-	var cmdSkills []skill.Skill
-	if !c.disableImplicitSkillInvocation {
-		cmdSkills = c.SlashSkills()
-	}
+	cmdSkills := c.SlashSkills()
 
 	entries := make([]command.SlashEntry, 0, len(cmdSkills)+len(cmds))
 	for _, sk := range cmdSkills {
@@ -4950,13 +4812,6 @@ func (c *Controller) Executor() *agent.Agent {
 
 func (c *Controller) Skills() []skill.Skill {
 	return c.skills.list()
-}
-
-// ImplicitSkillInvocationEnabled reports whether skills are exposed to the
-// model for automatic discovery and invocation. Explicit /skill handling is
-// independent of this model-facing capability.
-func (c *Controller) ImplicitSkillInvocationEnabled() bool {
-	return c != nil && !c.disableImplicitSkillInvocation
 }
 
 // SlashSkills returns the user-visible skill directory. Plugin skills use

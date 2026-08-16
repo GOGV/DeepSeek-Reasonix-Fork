@@ -6,13 +6,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { asArray } from "./array";
 import { addBreadcrumb } from "./breadcrumbs";
-import { app, onEvent, onReady, onRuntimeRebuilt, onTabMeta, onTopicActivation } from "./bridge";
+import { app, onEvent, onReady, onRuntimeRebuilt } from "./bridge";
 import { invalidateCache } from "./composerHistory";
 import { formatGuardianAssessmentNotice } from "./guardianEvents";
 import { createRafBatch } from "./rafBatch";
-import { aliasActivationRequest, noteActivationRequested, noteActivationSettled, noteActivationStarted } from "./sessionDiagnostics";
 import { applyLiveSegments, coalesceStreamDeltas, completeLiveReasoning, type StreamDeltaEntry, type StreamSegment } from "./streamDeltaBatch";
-import { getTranscriptStore } from "./transcriptStore";
 import { uiPerfTracker } from "./uiPerf";
 import { t, type DictKey } from "./i18n";
 import { sameTodoList } from "./todoVisibility";
@@ -37,7 +35,6 @@ import type {
   TabMeta,
   TokenMode,
   ToolApprovalMode,
-  TopicActivationEvent,
   WireApproval,
   WireAsk,
   WireDecisionReceipt,
@@ -216,17 +213,6 @@ type SyncActiveTabOptions = {
   preserveCachedHistory?: boolean;
 };
 
-// A ticketed StartTopicActivation in flight. Only the latest one is tracked:
-// superseded requests get "cancelled" from the backend and are ignored.
-type PendingTopicActivation = {
-  requestId: string;
-  navigationSeq: number;
-  tabId?: string;
-  placeholderItems?: Item[];
-  /** Terminal event that arrived before the ticket resolved. */
-  terminal?: TopicActivationEvent;
-};
-
 type ModelSwitchQueueResult = "applied" | "superseded";
 
 type ModelSwitchQueueRequest = {
@@ -244,7 +230,7 @@ type ModelSwitchQueueState = {
 const HISTORY_PAGE_TURNS = 60;
 
 export type Item =
-  | { kind: "user"; id: string; text: string; submitText?: string; failed?: boolean; createdAt?: number; checkpointTurn?: number }
+  | { kind: "user"; id: string; submissionId?: string; text: string; submitText?: string; failed?: boolean; createdAt?: number; checkpointTurn?: number }
   | { kind: "assistant"; id: string; text: string; reasoning: string; streaming: boolean; reasoningComplete?: boolean; reasoningDurationMs?: number; workDurationMs?: number; memoryCitations?: MemoryCitation[] }
   | { kind: "phase"; id: string; text: string }
   | { kind: "notice"; id: string; level: "info" | "warn"; text: string; detail?: string; title?: string; variant?: "delivery"; action?: "continue_delivery"; decisionReceipt?: WireDecisionReceipt }
@@ -381,6 +367,7 @@ interface State {
   currentAssistant?: string;
   live?: LiveStream;
   pendingUser?: string;
+  pendingSubmissionId?: string;
   deliveryRecoveryActive: boolean;
   discardTurn?: boolean;
   turnStartAt: number;
@@ -670,6 +657,13 @@ export function normalizeTurnSubmit(displayText: string, submitText: string): {
   return { display, submit };
 }
 
+const frontendSubmissionEpoch = typeof globalThis.crypto?.randomUUID === "function"
+  ? globalThis.crypto.randomUUID()
+  : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+export function createTurnSubmissionId(tabId: string, sessionGen: number, seq: number, runtimeEpoch?: string): string {
+  return JSON.stringify([frontendSubmissionEpoch, tabId, sessionGen, runtimeEpoch ?? "", seq]);
+}
+
 export function acceptsRuntimeEventEpoch(acceptedEpoch: string | undefined, eventEpoch: string | undefined): boolean {
   return !eventEpoch || !acceptedEpoch || acceptedEpoch === eventEpoch;
 }
@@ -780,9 +774,10 @@ function compactArchivedToolItems(items: Item[]): Item[] {
 type Action =
   | { type: "event"; e: WireEvent }
   | { type: "stream_batch"; segments: StreamSegment[] }
-  | { type: "user"; text: string; submitText?: string; seq: number; deliveryRecovery?: boolean }
+  | { type: "user"; text: string; submitText?: string; seq: number; submissionId: string; deliveryRecovery?: boolean }
   | { type: "unsend" }
-  | { type: "send_failed"; error: string }
+  | { type: "send_confirmed"; submissionId: string }
+  | { type: "send_failed"; submissionId: string; error: string }
   | { type: "backend_status"; running: boolean; pendingPrompt?: boolean; backgroundJobs?: number; cancelRequested?: boolean; cancellable?: boolean; snapshotAt?: number }
   | { type: "cancel_requested" }
   | { type: "meta"; meta: Meta }
@@ -801,15 +796,8 @@ type Action =
   | { type: "message_action_done" }
   | { type: "history"; messages: HistoryMessage[] }
   | { type: "history_page"; page: HistoryPage; mode: "replace" | "prepend" }
-  // TranscriptStore-driven history actions (windowed HistorySliceForTab flow).
-  // Items carry stable entryId-derived ids; prepend also lists existing item
-  // ids superseded by cross-page tool call/result merges.
-  | { type: "history_replace"; items: Item[]; startTurn: number; totalTurns: number; hasOlder: boolean }
-  | { type: "history_prepend"; items: Item[]; removeIds: string[]; startTurn: number; totalTurns: number; hasOlder: boolean }
-  | { type: "history_items_patch"; patches: Record<string, Item> }
   | { type: "history_older_start" }
   | { type: "history_older_error" }
-  | { type: "history_checkpoint_turns"; turns: number[] }
   | { type: "local_notice"; level: "info" | "warn"; text: string }
   | { type: "clearApproval" }
   | { type: "clearAsk" }
@@ -956,18 +944,14 @@ export function historyMessagesToItems(messages: HistoryMessage[], idPrefix: str
   return { items, seq };
 }
 
-function mergeHistoryCheckpointTurns(items: Item[], turns: number[], startTurn = 0): Item[] {
-  if (!turns.some((turn) => turn >= 0)) return items;
-  const offset = Math.max(0, Math.floor(startTurn));
-  let userIndex = 0;
+function applyTurnCheckpoint(items: Item[], submissionId: string | undefined, turn: number | undefined): Item[] {
+  if (!submissionId) return items;
+  const validTurn = turn !== undefined && Number.isInteger(turn) && turn >= 0;
   let changed = false;
   const next = items.map((item) => {
-    if (item.kind !== "user") return item;
-    const turn = turns[offset + userIndex];
-    userIndex += 1;
-    if (turn == null || turn < 0 || item.checkpointTurn === turn) return item;
+    if (item.kind !== "user" || item.submissionId !== submissionId) return item;
     changed = true;
-    return { ...item, checkpointTurn: turn };
+    return { ...item, submissionId: undefined, checkpointTurn: item.checkpointTurn ?? (validTurn ? turn : undefined) };
   });
   return changed ? next : items;
 }
@@ -1008,7 +992,7 @@ function positionalToolResultKey(messageIndex: number, callIndex: number): strin
   return `${messageIndex}:${callIndex}`;
 }
 
-export function historyToolError(output: string): string | undefined {
+function historyToolError(output: string): string | undefined {
   const trimmed = output.trimStart();
   if (
     trimmed.startsWith("[error") ||
@@ -1053,7 +1037,6 @@ function applyDeltaSegments(s: State, segments: StreamSegment[]): State {
 // pass, one notification. Mirrors applyEvent's preamble for delta events.
 function applyStreamBatch(s: State, segments: StreamSegment[]): State {
   if (s.discardTurn) return s;
-  if (s.pendingUser !== undefined) s = flushPendingUser(s);
   if (s.retry) s = { ...s, retry: undefined };
   return applyDeltaSegments(s, segments);
 }
@@ -1119,6 +1102,11 @@ function resetTurnTiming(now = Date.now()): Pick<State, "turnStartAt" | "turnDon
   };
 }
 
+function confirmPendingUser(s: State, submissionId: string | undefined): State {
+  if (!submissionId || s.pendingSubmissionId !== submissionId) return s;
+  return { ...s, pendingUser: undefined, pendingSubmissionId: undefined };
+}
+
 function beginTurnModelActivity(s: State, now = Date.now()): State {
   return s.turnModelActiveAt && s.turnModelActiveAt > 0
     ? s
@@ -1150,20 +1138,6 @@ function snapshotCompletedTurnTelemetry(s: State, now = Date.now()): State {
     lastTurnWaitAccumMs: settled.turnWaitAccumMs,
     lastTurnModelMs: settled.turnModelActiveMs,
     lastTurnOutputEstimated: settled.turnOutputEstimated || estimatedInFlightTokens > 0 || (settled.turnOutputTokens === 0 && settled.turnOutputChars > 0),
-  };
-}
-
-function flushPendingUser(s: State): State {
-  if (s.pendingUser === undefined) return s;
-  const lastItem = s.items[s.items.length - 1];
-  if (lastItem?.kind === "user" && lastItem.text === s.pendingUser) {
-    return { ...s, pendingUser: undefined };
-  }
-  return {
-    ...s,
-    seq: s.seq + 1,
-    items: [...s.items, { kind: "user", id: `u${s.seq}`, text: s.pendingUser, createdAt: Date.now() }],
-    pendingUser: undefined,
   };
 }
 
@@ -1379,20 +1353,32 @@ function applyExtensionNotification(s: State, surface: WireExtensionSurface): St
 
 function applyEvent(s: State, e: WireEvent): State {
   if (s.discardTurn) {
-    if (e.kind === "turn_done") return { ...s, discardTurn: false, running: false, turnActive: false, pendingPrompt: false, cancelRequested: false, cancellable: false, currentAssistant: undefined, live: undefined };
+    if (e.kind === "turn_done") {
+      return {
+        ...s,
+        items: applyTurnCheckpoint(s.items, e.submissionId, e.checkpointTurn),
+        discardTurn: false,
+        running: false,
+        turnActive: false,
+        pendingPrompt: false,
+        cancelRequested: false,
+        cancellable: false,
+        currentAssistant: undefined,
+        live: undefined,
+      };
+    }
     return s;
   }
+  s = confirmPendingUser(s, e.submissionId);
   if (e.kind === "mcp_surface_ready") {
-    // Background-only events must not confirm an optimistic user bubble.
+    // Background readiness remains a no-op unless the sink explicitly
+    // correlates it to this submit in the common preamble above.
     return s;
   }
   if (e.kind === "extension_surface" || e.kind === "extension_status") {
-    // Sidecar surface publications are background-only too: they must neither
-    // confirm an optimistic user bubble nor clear the retry indicator.
+    // Sidecar publications without exact sink correlation remain background-
+    // only and must not clear the retry indicator.
     return applyExtensionSurfaceEvent(s, e.extension);
-  }
-  if (s.pendingUser !== undefined && e.kind !== "turn_done") {
-    s = flushPendingUser(s);
   }
   if (e.kind === "retrying") {
     // Retrying is emitted synchronously from inside the foreground provider
@@ -1421,15 +1407,13 @@ function applyEvent(s: State, e: WireEvent): State {
   if (s.retry) s = { ...s, retry: undefined };
   switch (e.kind) {
     case "turn_started": {
-      // Flush the user message and pre-create an empty assistant bubble
+      // Pre-create an empty assistant bubble
       // immediately so the user sees their message + a blinking cursor the
       // instant the backend acknowledges the turn — no dead gap waiting for
       // the first text/reasoning token.
-      let cur: State = s;
-      if (cur.pendingUser !== undefined) cur = flushPendingUser(cur);
-      const { items, id, seq } = ensureAssistant(cur);
+      const { items, id, seq } = ensureAssistant(s);
       return {
-        ...cur,
+        ...s,
         items,
         currentAssistant: id,
         seq,
@@ -1728,7 +1712,6 @@ function applyEvent(s: State, e: WireEvent): State {
       return { ...s, seq: s.seq + 1, items: [...s.items, { kind: "notice", id: `g${s.seq}`, level, text: formatGuardianAssessmentNotice(e.guardian) }] };
     }
     case "turn_done": {
-      if (s.pendingUser !== undefined) s = flushPendingUser(s);
       const now = Date.now();
       s = snapshotCompletedTurnTelemetry(s, now);
       const workDurationMs = currentTurnDurationMs(s, now);
@@ -1803,7 +1786,7 @@ function applyEvent(s: State, e: WireEvent): State {
       const keepPlanApproval = s.approval?.tool === "exit_plan_mode";
       let next: State = {
         ...s,
-        items,
+        items: applyTurnCheckpoint(items, e.submissionId, e.checkpointTurn),
         live: undefined,
         streamAttemptJournal: undefined,
         running: keepPlanApproval,
@@ -1829,10 +1812,11 @@ export function reducer(s: State, a: Action): State {
   switch (a.type) {
     case "user": {
       const seq = a.seq !== undefined ? a.seq : s.seq;
+      const userItemId = `u${seq}`;
       return {
         ...s,
         seq: seq + 1,
-        items: [...s.items, { kind: "user", id: `u${seq}`, text: a.text, submitText: a.submitText, createdAt: Date.now() }],
+        items: [...s.items, { kind: "user", id: userItemId, submissionId: a.submissionId, text: a.text, submitText: a.submitText, createdAt: Date.now() }],
         running: true,
         pendingPrompt: false,
         cancelRequested: false,
@@ -1843,6 +1827,7 @@ export function reducer(s: State, a: Action): State {
         promptArrivedAt: undefined,
         promptArrivedId: undefined,
         pendingUser: a.text,
+        pendingSubmissionId: a.submissionId,
         deliveryRecoveryActive: Boolean(a.deliveryRecovery),
         discardTurn: false,
       };
@@ -1851,6 +1836,7 @@ export function reducer(s: State, a: Action): State {
       const cleared = endPromptWait({
         ...s,
         pendingUser: undefined,
+        pendingSubmissionId: undefined,
         discardTurn: true,
         running: false,
         pendingPrompt: false,
@@ -1876,16 +1862,13 @@ export function reducer(s: State, a: Action): State {
         cancellable: s.running || s.turnActive,
       });
     }
+    case "send_confirmed": return confirmPendingUser(s, a.submissionId);
     case "send_failed": {
-      if (s.pendingUser === undefined) return s;
-      let idx = -1;
-      for (let i = s.items.length - 1; i >= 0; i--) {
-        const it = s.items[i];
-        if (it.kind === "user" && it.text === s.pendingUser) { idx = i; break; }
-      }
-      const items = idx >= 0 ? s.items.map((it, i) => (i === idx ? { ...it, failed: true } : it)) : s.items;
+      if (s.pendingSubmissionId !== a.submissionId) return s;
+      const idx = s.items.findIndex((it) => it.kind === "user" && it.submissionId === a.submissionId);
+      const items = idx >= 0 ? s.items.map((it, i) => (i === idx ? { ...it, submissionId: undefined, failed: true } : it)) : s.items;
       const notice: Item = { kind: "notice", id: `n${s.seq}`, level: "warn", text: a.error };
-      return { ...s, pendingUser: undefined, deliveryRecoveryActive: false, running: false, turnActive: false, pendingPrompt: false, cancelRequested: false, cancellable: false, live: undefined, seq: s.seq + 1, items: [...items, notice] };
+      return { ...s, pendingUser: undefined, pendingSubmissionId: undefined, deliveryRecoveryActive: false, running: false, turnActive: false, pendingPrompt: false, cancelRequested: false, cancellable: false, live: undefined, seq: s.seq + 1, items: [...items, notice] };
     }
     case "backend_status": {
       // A snapshot fetched before the live approval/ask event arrived cannot
@@ -2011,7 +1994,7 @@ export function reducer(s: State, a: Action): State {
     case "message_action_done": return { ...s, messageAction: undefined };
     case "history": {
       const { items, seq } = historyMessagesToItems(a.messages, "h", s.seq);
-      return { ...s, items: compactArchivedToolItems(items), seq, hydrateHistoryLoaded: true, hydratePlaceholderItems: undefined, historyStartTurn: 0, historyTotalTurns: 0, historyHasOlder: false, historyOlderLoading: false };
+      return { ...s, items: compactArchivedToolItems(items), pendingSubmissionId: undefined, seq, hydrateHistoryLoaded: true, hydratePlaceholderItems: undefined, historyStartTurn: 0, historyTotalTurns: 0, historyHasOlder: false, historyOlderLoading: false };
     }
     case "history_page": {
       const { items, seq } = historyPageItems(a.page);
@@ -2019,6 +2002,7 @@ export function reducer(s: State, a: Action): State {
       return {
         ...s,
         items: compactArchivedToolItems(nextItems),
+        pendingSubmissionId: a.mode === "replace" ? undefined : s.pendingSubmissionId,
         seq: Math.max(s.seq, seq),
         hydrateHistoryLoaded: true,
         hydratePlaceholderItems: undefined,
@@ -2030,46 +2014,6 @@ export function reducer(s: State, a: Action): State {
     }
     case "history_older_start": return s.historyOlderLoading ? s : { ...s, historyOlderLoading: true };
     case "history_older_error": return s.historyOlderLoading ? { ...s, historyOlderLoading: false } : s;
-    case "history_replace":
-      return {
-        ...s,
-        items: compactArchivedToolItems(a.items),
-        hydrateHistoryLoaded: true,
-        hydratePlaceholderItems: undefined,
-        historyStartTurn: a.startTurn,
-        historyTotalTurns: a.totalTurns,
-        historyHasOlder: a.hasOlder,
-        historyOlderLoading: false,
-      };
-    case "history_prepend": {
-      const remove = a.removeIds.length > 0 ? new Set(a.removeIds) : undefined;
-      const rest = remove ? s.items.filter((item) => !remove.has(item.id)) : s.items;
-      return {
-        ...s,
-        items: compactArchivedToolItems([...a.items, ...rest]),
-        hydrateHistoryLoaded: true,
-        hydratePlaceholderItems: undefined,
-        historyStartTurn: a.startTurn,
-        historyTotalTurns: a.totalTurns,
-        historyHasOlder: a.hasOlder,
-        historyOlderLoading: false,
-      };
-    }
-    // Ref-resolved full content landed for history items already on screen:
-    // patch by stable item id so the live tail and untouched items keep their
-    // identity.
-    case "history_items_patch": {
-      let changed = false;
-      const next = s.items.map((item) => {
-        const patch = a.patches[item.id];
-        if (!patch) return item;
-        changed = true;
-        return patch;
-      });
-      return changed ? { ...s, items: next } : s;
-    }
-    case "history_checkpoint_turns":
-      return { ...s, items: mergeHistoryCheckpointTurns(s.items, a.turns, s.historyStartTurn) };
     case "local_notice": return { ...s, running: false, turnActive: false, seq: s.seq + 1, items: [...s.items, { kind: "notice", id: `n${s.seq}`, level: a.level, text: a.text }] };
     case "clearApproval": {
       const next = { ...s, approval: undefined, pendingPrompt: Boolean(s.ask), resolvedPromptId: s.approval?.id ?? s.resolvedPromptId };
@@ -2115,7 +2059,9 @@ export function reducer(s: State, a: Action): State {
       // the id-anchored bookkeeping.
       return {
         ...s,
+        items: s.items.map((item) => item.kind === "user" && item.submissionId ? { ...item, submissionId: undefined } : item),
         promptEpoch: s.promptEpoch + 1,
+        pendingSubmissionId: undefined,
         resolvedPromptId: undefined,
         promptArrivedId: undefined,
         promptArrivedAt: undefined,
@@ -2407,7 +2353,7 @@ function recoveryNoticeDedupeKey(text: string, code?: string): string {
   return "";
 }
 
-export function quietTranscriptNoticeKey(text: string, code?: string): string {
+function quietTranscriptNoticeKey(text: string, code?: string): string {
   const recovery = recoveryNoticeDedupeKey(text, code);
   if (recovery) return recovery;
 
@@ -2595,12 +2541,6 @@ export function useController() {
   const stateRef = useRef(activeState);
   const backendActiveTabIdRef = useRef<string | undefined>(undefined);
   const backendActivationPromises = useRef(new Map<string, Promise<boolean>>());
-  // The latest ticketed topic activation (StartTopicActivation). Registered
-  // before the backend call returns so synchronously-emitted lifecycle events
-  // always match; a terminal event arriving before the ticket is stashed and
-  // replayed once the ticket lands.
-  const pendingTopicActivationRef = useRef<PendingTopicActivation | undefined>(undefined);
-  const topicActivationSeqRef = useRef(0);
   const readyMetaReconcileSeq = useRef(0);
   const readyMetaReconcileActive = useRef<{ tabId: string; seq: number } | undefined>(undefined);
   activeTabIdRef.current = activeTabId;
@@ -2614,9 +2554,6 @@ export function useController() {
     const next = reducer(prev, action);
     if (prev !== next) {
       states.set(tabId, next);
-      // A tab with a live or in-flight turn is pinned out of transcript-store
-      // eviction; its cached rows must survive until the turn settles.
-      getTranscriptStore().setPinned(tabId, Boolean(next.running || next.turnActive || next.live));
       uiPerfTracker.onStateCommit();
       notifyLiveListeners(tabId);
       const streamDeltaOnly =
@@ -2722,7 +2659,6 @@ export function useController() {
   const metaRefreshSeq = useRef(new Map<string, number>());
   const sessionLoadSeq = useRef(new Map<string, number>());
   const sessionLoadInFlight = useRef(new Map<string, { sessionPath: string; promise: Promise<void> }>());
-  const transcriptSubscriptions = useRef(new Map<string, () => void>());
   const bumpMetaRefreshSeq = useCallback((tabId: string): number => {
     const seq = (metaRefreshSeq.current.get(tabId) ?? 0) + 1;
     metaRefreshSeq.current.set(tabId, seq);
@@ -2740,22 +2676,6 @@ export function useController() {
     sessionLoadSeq.current.set(tabId, seq);
     return seq;
   }, [bumpMetaRefreshSeq]);
-  // Ref-resolved content updates flow from the transcript store into the tab's
-  // state as id-keyed patches. Subscribed once per tab; released when the tab
-  // state is dropped (close / single-surface prune).
-  const ensureTranscriptSubscription = useCallback((tabId: string) => {
-    if (transcriptSubscriptions.current.has(tabId)) return;
-    const unsubscribe = getTranscriptStore().subscribe(tabId, (change) => {
-      if (!statesRef.current.has(tabId)) return;
-      dispatchTo(tabId, { type: "history_items_patch", patches: change.patches });
-    });
-    transcriptSubscriptions.current.set(tabId, unsubscribe);
-  }, [dispatchTo]);
-  const releaseTranscriptState = useCallback((tabId: string) => {
-    transcriptSubscriptions.current.get(tabId)?.();
-    transcriptSubscriptions.current.delete(tabId);
-    getTranscriptStore().evictTab(tabId);
-  }, []);
   const sessionLoadCurrent = useCallback((tabId: string, seq: number): boolean => {
     return sessionLoadSeq.current.get(tabId) === seq;
   }, []);
@@ -2819,7 +2739,6 @@ export function useController() {
         (options.preserveCachedHistory && !reset && hasReusableCachedTranscript(statesRef.current.get(tabId), options.sessionPath)),
       );
       addBreadcrumb("tab.hydrate", `start ${reason} ${tabId}`);
-      ensureTranscriptSubscription(tabId);
       dispatchTo(tabId, { type: "hydrate_start", reason, placeholderItems: options.placeholderItems });
       if (reset && sessionLoadCurrent(tabId, seq)) dispatchTo(tabId, { type: "reset" });
 
@@ -2844,36 +2763,22 @@ export function useController() {
       };
 
       const historyStartedAt = Date.now();
-      const projection = skipHistory
+      const historyPage = skipHistory
         ? undefined
-        : await loadTimed("history", () =>
-            // Windowed slice load through the transcript store. A resident
-            // session (LRU hit) projects synchronously with no backend round
-            // trip; reset loads always re-fetch so a rebound session can never
-            // serve the previous session's rows.
-            getTranscriptStore().loadLatest(tabId, sessionPath, {
-              turns: HISTORY_PAGE_TURNS,
-              preferResident: !reset,
-            }),
-          );
+        : await loadTimed("history", () => app.HistoryPageForTab(tabId, 0, HISTORY_PAGE_TURNS));
 
       if (!stillCurrent()) return;
-      if (!skipHistory && projection !== undefined) {
-        dispatchTo(tabId, {
-          type: "history_replace",
-          items: projection.items,
-          startTurn: projection.startTurn,
-          totalTurns: projection.totalTurns,
-          hasOlder: projection.hasOlder,
-        });
+      if (!skipHistory && historyPage !== undefined) {
+        const messages = asArray(historyPage.messages);
+        dispatchTo(tabId, { type: "history_page", page: historyPage, mode: "replace" });
         addBreadcrumb(
           "tab.hydrate",
-          `history page ${tabId} items=${projection.items.length} turns=${projection.startTurn}-${projection.endTurn}/${projection.totalTurns} ms=${Date.now() - historyStartedAt}`,
+          `history page ${tabId} messages=${messages.length} turns=${historyPage.startTurn}-${historyPage.endTurn}/${historyPage.totalTurns} ms=${Date.now() - historyStartedAt}`,
         );
         if (reason === "switch-tab") {
           addBreadcrumb(
             "tab.switch",
-            `history-done ${tabId} items=${projection.items.length} turns=${projection.startTurn}-${projection.endTurn}/${projection.totalTurns} ms=${Date.now() - historyStartedAt}`,
+            `history-done ${tabId} messages=${messages.length} turns=${historyPage.startTurn}-${historyPage.endTurn}/${historyPage.totalTurns} ms=${Date.now() - historyStartedAt}`,
           );
         }
       } else if (skipHistory) {
@@ -2952,69 +2857,32 @@ export function useController() {
     }
   }, [bumpSessionLoadSeq, dispatchTo, loadMetaForTab, refreshBalanceForTab, sessionLoadCurrent]);
 
-  // On-demand full content for a ref-replaced history field (entries carrying
-  // refs[] ship a ≤4KiB preview inline). Resolves through the transcript
-  // store, which patches the projected items by stable id on completion. The
-  // rendering layer calls this when a truncated entry scrolls into view.
-  const requestHistoryFullContent = useCallback(async (entryId: string, field: string): Promise<string | undefined> => {
-    const tabId = activeTabIdRef.current;
-    if (!tabId) return undefined;
-    ensureTranscriptSubscription(tabId);
-    return getTranscriptStore().requestFullContent(tabId, entryId, field);
-  }, [ensureTranscriptSubscription]);
-
   const loadOlderHistory = useCallback(async (tabId?: string): Promise<void> => {
     const targetTabId = tabId || activeTabIdRef.current;
     if (!targetTabId) return;
     const state = statesRef.current.get(targetTabId);
     if (!state?.historyHasOlder || state.historyOlderLoading || state.running) return;
+    const beforeTurn = state.historyStartTurn;
     const sessionPath = state.meta?.sessionPath ?? "";
-    ensureTranscriptSubscription(targetTabId);
     dispatchTo(targetTabId, { type: "history_older_start" });
     const startedAt = Date.now();
     try {
-      const result = await getTranscriptStore().loadOlder(targetTabId, sessionPath, { turns: HISTORY_PAGE_TURNS });
+      const page = await app.HistoryPageForTab(targetTabId, beforeTurn, HISTORY_PAGE_TURNS);
       const current = statesRef.current.get(targetTabId);
-      // A replace-level hydrate while the page was in flight clears
-      // historyOlderLoading; prepending on top of it would duplicate rows.
-      if (!current || !current.historyOlderLoading || (current.meta?.sessionPath ?? "") !== sessionPath) {
+      if (!current || current.historyStartTurn !== beforeTurn || (current.meta?.sessionPath ?? "") !== sessionPath) {
         dispatchTo(targetTabId, { type: "history_older_error" });
         return;
       }
-      if (!result) {
-        // Superseded (generation moved) or nothing older left.
-        dispatchTo(targetTabId, { type: "history_older_error" });
-        return;
-      }
-      if (result.kind === "reload") {
-        // The cursor went stale (session rewritten): the store reloaded the
-        // latest page; replace instead of prepend.
-        dispatchTo(targetTabId, {
-          type: "history_replace",
-          items: result.items,
-          startTurn: result.startTurn,
-          totalTurns: result.totalTurns,
-          hasOlder: result.hasOlder,
-        });
-      } else {
-        dispatchTo(targetTabId, {
-          type: "history_prepend",
-          items: result.prependItems,
-          removeIds: result.removeIds,
-          startTurn: result.startTurn,
-          totalTurns: result.totalTurns,
-          hasOlder: result.hasOlder,
-        });
-      }
+      dispatchTo(targetTabId, { type: "history_page", page, mode: "prepend" });
       addBreadcrumb(
         "tab.hydrate",
-        `history older ${targetTabId} kind=${result.kind} items=${result.kind === "prepend" ? result.prependItems.length : result.items.length} turns=${result.startTurn}-${result.endTurn}/${result.totalTurns} ms=${Date.now() - startedAt}`,
+        `history older ${targetTabId} messages=${asArray(page.messages).length} turns=${page.startTurn}-${page.endTurn}/${page.totalTurns} ms=${Date.now() - startedAt}`,
       );
     } catch (err) {
       dispatchTo(targetTabId, { type: "history_older_error" });
       addBreadcrumb("tab.hydrate", `history older failed ${targetTabId}: ${errorMessage(err)}`);
     }
-  }, [dispatchTo, ensureTranscriptSubscription]);
+  }, [dispatchTo]);
 
   const activeTabFromBackend = useCallback(async (): Promise<TabMeta | undefined> => {
     const tabs = asArray(await app.ListTabs().catch(() => [] as TabMeta[]));
@@ -3161,49 +3029,6 @@ export function useController() {
     cancelReconcileTimers.current.set(tabId, timer);
   }, [clearCancelReconcileTimer, reconcileTabRuntime]);
 
-  // Topic-activation lifecycle events drive the ticketed activation flow: the
-  // visible surface already switched when StartTopicActivation returned; the
-  // history hydrate waits for the terminal "ready" of the LATEST request.
-  // Events for superseded requestIds (including their "cancelled") are
-  // dropped; agent:ready/agent:event handling is untouched and still covers
-  // every non-ticketed flow (rebind, recovery, restore, SetActiveTab).
-  const handleTopicActivationEvent = useCallback((event: TopicActivationEvent) => {
-    const pending = pendingTopicActivationRef.current;
-    if (!pending || event.requestId !== pending.requestId) return;
-    if (event.phase === "starting") {
-      noteActivationStarted(event.requestId, event.tabId);
-      return;
-    }
-    if (!pending.tabId) {
-      // The ticket has not resolved yet; replay once activateTopic applies it.
-      pending.terminal = event;
-      return;
-    }
-    if (event.phase === "cancelled") {
-      noteActivationSettled(event.requestId, "cancelled");
-      if (pendingTopicActivationRef.current === pending) pendingTopicActivationRef.current = undefined;
-      return;
-    }
-    pendingTopicActivationRef.current = undefined;
-    if (!isNavigationIntentCurrent(pending.navigationSeq)) return;
-    const tabId = pending.tabId;
-    if (activeTabIdRef.current !== tabId) return;
-    if (event.phase === "failed") {
-      noteActivationSettled(event.requestId, "failed", event.error);
-      dispatchTo(tabId, {
-        type: "hydrate_error",
-        reason: "open-topic",
-        error: event.error?.trim() || "session is not ready",
-      });
-      return;
-    }
-    noteActivationSettled(event.requestId, "ready");
-    ensureTranscriptSubscription(tabId);
-    void loadSessionDataForTab(tabId, true, "open-topic", { placeholderItems: pending.placeholderItems })
-      .then(() => reconcileTabRuntime(tabId, { hydrateSessionData: false }))
-      .catch(() => {});
-  }, [dispatchTo, ensureTranscriptSubscription, isNavigationIntentCurrent, loadSessionDataForTab, reconcileTabRuntime]);
-
   useEffect(() => {
     const textBatch = createRafBatch<StreamDeltaEntry>((batch) => {
       uiPerfTracker.onStreamDispatch();
@@ -3224,17 +3049,13 @@ export function useController() {
       uiPerfTracker.onWireEvent(targetTabId, e.kind);
       if (TURN_ACTIVITY_KINDS.has(e.kind)) lastTurnActivityAtByTab.current.set(targetTabId, Date.now());
       if (e.kind === "text" || e.kind === "reasoning") {
+        if (e.submissionId) dispatchTo(targetTabId, { type: "send_confirmed", submissionId: e.submissionId });
         textBatch.push({ tabId: targetTabId, e });
       } else {
         textBatch.drain();
         dispatchTo(targetTabId, { type: "event", e });
       }
       if (e.kind === "turn_done") {
-        if (!e.err) {
-          app.HistoryCheckpointTurnsForTab(targetTabId)
-            .then((turns) => dispatchTo(targetTabId, { type: "history_checkpoint_turns", turns: asArray(turns) }))
-            .catch(() => {});
-        }
         app
           .ContextUsageForTab(targetTabId)
           .then((context) => dispatchTo(targetTabId, { type: "context", context }))
@@ -3277,26 +3098,6 @@ export function useController() {
       }
     });
 
-    const offTopicActivation = onTopicActivation(handleTopicActivationEvent);
-
-    // tab:meta carries a full refreshed Meta after the backend's background
-    // refresh of the expensive fields (git branch, image-input capability) —
-    // those arrive empty in the first MetaForTab response now. Merge it like a
-    // MetaForTab result, fenced to the session the tab is currently bound to.
-    const offTabMeta = onTabMeta(({ tabId, meta }) => {
-      if (!tabId || !meta) return;
-      const current = statesRef.current.get(tabId);
-      if (!current?.meta) return;
-      if (
-        meta.sessionPath !== undefined &&
-        current.meta.sessionPath !== undefined &&
-        meta.sessionPath !== current.meta.sessionPath
-      ) {
-        return;
-      }
-      dispatchTo(tabId, { type: "meta", meta });
-    });
-
     void syncActiveTabFromBackend(false, true);
     // The event subscription is live now, so ask the backend to re-emit any
     // approval/ask prompt that was already blocking a tab before this load —
@@ -3317,20 +3118,8 @@ export function useController() {
       off();
       offReady();
       offRebuilt();
-      offTopicActivation();
-      offTabMeta();
     };
-  }, [dispatchTo, handleTopicActivationEvent, loadSessionDataForTab, refreshBalanceForTab, refreshCheckpoints, refreshMetaForTab, syncActiveTabFromBackend]);
-
-  // Track the visible tab in the transcript store: the active tab is pinned
-  // out of LRU eviction. (In-flight loads of background tabs still complete
-  // into their own per-tab state; store generations move on session switch,
-  // evict, and unload — not on visible-tab changes.)
-  const previousStoreActiveTabRef = useRef<string | undefined>(undefined);
-  useEffect(() => {
-    getTranscriptStore().noteActiveTab(activeTabId, previousStoreActiveTabRef.current);
-    previousStoreActiveTabRef.current = activeTabId;
-  }, [activeTabId]);
+  }, [dispatchTo, loadSessionDataForTab, refreshBalanceForTab, refreshCheckpoints, refreshMetaForTab, syncActiveTabFromBackend]);
 
   // Keep shared all-source telemetry live between turn boundaries. Delivery
   // mode can complete dozens of provider requests inside one UI turn, while
@@ -3451,14 +3240,15 @@ export function useController() {
       throw new Error(runtime?.issue?.message || currentState.meta.startupErr || t("composer.workspaceStarting"));
     }
     const seq = currentState.seq;
+    const submissionId = createTurnSubmissionId(tabId, currentState.sessionGen, seq, runtimeEpochByTabRef.current.get(tabId) ?? runtime?.epoch);
     const promptEpoch = currentState.promptEpoch;
     const { display, submit } = normalizeTurnSubmit(displayText, submitText);
     const original = originalText?.trim() ?? "";
-    dispatchTo(tabId, { type: "user", text: displayText, submitText: display !== submit ? submit : undefined, seq });
+    dispatchTo(tabId, { type: "user", text: displayText, submitText: display !== submit ? submit : undefined, seq, submissionId });
     invalidateCache();
     try {
       const submitPromise = initialGoal
-        ? app.SubmitInitialGoalToTab(
+        ? app.SubmitInitialGoalToTabWithID(
             tabId,
             initialGoal.goal,
             structured?.display.trim() || display,
@@ -3466,23 +3256,26 @@ export function useController() {
             structured?.invocations ?? [],
             initialGoal.collaborationMode,
             initialGoal.toolApprovalMode,
+            submissionId,
           )
         : structured
-        ? app.SubmitInvocationsToTab(tabId, structured.display.trim(), structured.input.trim(), structured.invocations)
+        ? app.SubmitInvocationsToTabWithID(tabId, structured.display.trim(), structured.input.trim(), structured.invocations, submissionId)
         : original
-        ? app.SubmitEditedDisplayToTab(tabId, display, submit, original)
-        : display !== submit ? app.SubmitDisplayToTab(tabId, display, submit) : app.SubmitToTab(tabId, submit);
+        ? app.SubmitEditedDisplayToTabWithID(tabId, display, submit, original, submissionId)
+        : display !== submit ? app.SubmitDisplayToTabWithID(tabId, display, submit, submissionId) : app.SubmitToTabWithID(tabId, submit, submissionId);
       if (initialGoal) {
         const drained = await submitPromise;
+        dispatchTo(tabId, { type: "send_confirmed", submissionId });
         const ids = Array.isArray(drained) ? drained : [];
         if (ids.length) dispatchTo(tabId, { type: "approval_drained", ids, epoch: promptEpoch });
         return;
       }
-      void submitPromise.catch((error) => {
-        dispatchTo(tabId, { type: "send_failed", error: `Send failed: ${error instanceof Error ? error.message : String(error)}` });
-      });
+      void submitPromise.then(
+        () => dispatchTo(tabId, { type: "send_confirmed", submissionId }),
+        (error) => dispatchTo(tabId, { type: "send_failed", submissionId, error: `Send failed: ${error instanceof Error ? error.message : String(error)}` }),
+      );
     } catch (error) {
-      dispatchTo(tabId, { type: "send_failed", error: `Send failed: ${error instanceof Error ? error.message : String(error)}` });
+      dispatchTo(tabId, { type: "send_failed", submissionId, error: `Send failed: ${error instanceof Error ? error.message : String(error)}` });
       throw error;
     }
   }, [dispatchTo]);
@@ -3495,16 +3288,18 @@ export function useController() {
       throw new Error(runtime?.issue?.message || currentState.meta.startupErr || t("composer.workspaceStarting"));
     }
     const seq = currentState.seq;
+    const submissionId = createTurnSubmissionId(tabId, currentState.sessionGen, seq, runtimeEpochByTabRef.current.get(tabId) ?? runtime?.epoch);
     const display = displayText.trim();
     const submit = submitText.trim();
-    dispatchTo(tabId, { type: "user", text: displayText, submitText: display !== submit ? submit : undefined, seq, deliveryRecovery: true });
+    dispatchTo(tabId, { type: "user", text: displayText, submitText: display !== submit ? submit : undefined, seq, submissionId, deliveryRecovery: true });
     invalidateCache();
     try {
-      void app.SubmitDeliveryRecoveryToTab(tabId, display, submit).catch((error) => {
-        dispatchTo(tabId, { type: "send_failed", error: `Send failed: ${error instanceof Error ? error.message : String(error)}` });
-      });
+      void app.SubmitDeliveryRecoveryToTabWithID(tabId, display, submit, submissionId).then(
+        () => dispatchTo(tabId, { type: "send_confirmed", submissionId }),
+        (error) => dispatchTo(tabId, { type: "send_failed", submissionId, error: `Send failed: ${error instanceof Error ? error.message : String(error)}` }),
+      );
     } catch (error) {
-      dispatchTo(tabId, { type: "send_failed", error: `Send failed: ${error instanceof Error ? error.message : String(error)}` });
+      dispatchTo(tabId, { type: "send_failed", submissionId, error: `Send failed: ${error instanceof Error ? error.message : String(error)}` });
       throw error;
     }
   }, [dispatchTo]);
@@ -3527,11 +3322,14 @@ export function useController() {
 
   const runShellForTab = useCallback(async (tabId: string, command: string) => {
     if (!tabId) throw new Error(t("composer.workspaceStarting"));
-    dispatchTo(tabId, { type: "user", text: `!${command}`, seq: getOrCreateState(statesRef.current, tabId).seq });
+    const currentState = getOrCreateState(statesRef.current, tabId);
+    const submissionId = createTurnSubmissionId(tabId, currentState.sessionGen, currentState.seq, runtimeEpochByTabRef.current.get(tabId) ?? currentState.meta?.runtime?.epoch);
+    dispatchTo(tabId, { type: "user", text: `!${command}`, seq: currentState.seq, submissionId });
     try {
       await app.RunShellForTab(tabId, command);
+      dispatchTo(tabId, { type: "send_confirmed", submissionId });
     } catch (error) {
-      dispatchTo(tabId, { type: "send_failed", error: `Command failed: ${error instanceof Error ? error.message : String(error)}` });
+      dispatchTo(tabId, { type: "send_failed", submissionId, error: `Command failed: ${error instanceof Error ? error.message : String(error)}` });
       throw error;
     }
   }, [dispatchTo]);
@@ -4214,9 +4012,6 @@ export function useController() {
     const navigationSeq = navigationIntentSeq ?? beginActiveNavigation();
     if (!navigationCompletionCurrent(navigationSeq, "tab.switch", tabId)) return undefined;
     const startedAt = Date.now();
-    topicActivationSeqRef.current += 1;
-    const switchRequestId = `fe-switch-${Date.now()}-${topicActivationSeqRef.current}`;
-    noteActivationRequested(switchRequestId);
     const previousTabId = activeTabIdRef.current;
     const targetSessionPath = optimisticTab?.sessionPath ?? statesRef.current.get(tabId)?.meta?.sessionPath;
     const preserveCachedHistory = hasReusableCachedTranscript(statesRef.current.get(tabId), targetSessionPath);
@@ -4224,7 +4019,6 @@ export function useController() {
     setActiveTabId(tabId);
     activeTabIdRef.current = tabId;
     dispatchTo(tabId, { type: "backend_activation_start" });
-    noteActivationStarted(switchRequestId, tabId);
     if (optimisticTab) {
       dispatchTo(tabId, { type: "optimistic_meta", meta: metaFromTab(optimisticTab, statesRef.current.get(tabId)?.meta) });
       const optimisticStatus = backendStatusFromRuntimeMeta(optimisticTab);
@@ -4237,7 +4031,6 @@ export function useController() {
         const navigationCurrent = isNavigationIntentCurrent(navigationSeq);
         if (!navigationCurrent || activeTabIdRef.current !== tabId) {
           const currentTabId = activeTabIdRef.current;
-          noteActivationSettled(switchRequestId, "cancelled");
           await reassertVisibleTabAfterStaleNavigation("tab.switch", tabId);
           addBreadcrumb("tab.switch", `set-active-stale ${tabId} seq=${navigationSeq} current=${currentTabId ?? ""} ms=${Date.now() - startedAt}`);
           return false;
@@ -4247,7 +4040,6 @@ export function useController() {
         return true;
       })
       .catch((err) => {
-        noteActivationSettled(switchRequestId, "failed", errorMessage(err));
         if (!isNavigationIntentCurrent(navigationSeq)) return false;
         dispatchTo(tabId, { type: "backend_activation_done" });
         dispatchTo(tabId, { type: "hydrate_error", reason: "switch-tab", error: errorMessage(err) });
@@ -4261,10 +4053,7 @@ export function useController() {
     trackBackendActivation(tabId, backendActivation);
     const backendSwitch = backendActivation
       .then(async (activated) => {
-        if (!activated || !isNavigationIntentCurrent(navigationSeq)) {
-          if (!activated) noteActivationSettled(switchRequestId, "failed", "backend activation did not complete");
-          return undefined;
-        }
+        if (!activated || !isNavigationIntentCurrent(navigationSeq)) return undefined;
         const tabs = await reconcileTabRuntime(tabId, { hydrateSessionData: false });
         if (!isNavigationIntentCurrent(navigationSeq)) return tabs;
         void loadSessionDataForTab(tabId, false, "switch-tab", {
@@ -4272,11 +4061,9 @@ export function useController() {
           preserveCachedHistory,
           sessionPath: targetSessionPath,
         });
-        noteActivationSettled(switchRequestId, "ready");
         return tabs;
       })
       .catch((err) => {
-        noteActivationSettled(switchRequestId, "failed", errorMessage(err));
         if (isNavigationIntentCurrent(navigationSeq)) {
           dispatchTo(tabId, { type: "hydrate_error", reason: "switch-tab", error: errorMessage(err) });
         }
@@ -4369,30 +4156,7 @@ export function useController() {
   const activateTopic = useCallback(async (scope: string, workspaceRoot: string, topicId: string, sessionPath = "", navigationIntentSeq?: number): Promise<TabMeta> => {
     const navigationSeq = navigationIntentSeq ?? beginActiveNavigation();
     const snapshotAt = promptEventClock();
-    // Ticketed two-phase activation: the backend switches the visible surface
-    // before returning the ticket; the controller build and tab prune finish
-    // in the background and report through "topic:activation". Register the
-    // pending ticket before the call so synchronously-emitted events match.
-    topicActivationSeqRef.current += 1;
-    const pending: PendingTopicActivation = {
-      requestId: `fe-act-${Date.now()}-${topicActivationSeqRef.current}`,
-      navigationSeq,
-    };
-    pendingTopicActivationRef.current = pending;
-    noteActivationRequested(pending.requestId);
-    const ticket = await app.StartTopicActivation({
-      scope,
-      workspaceRoot,
-      topicId,
-      sessionPath,
-      requestId: pending.requestId,
-    });
-    const meta = ticket.meta;
-    pending.tabId = ticket.tabId;
-    if (pendingTopicActivationRef.current === pending && ticket.requestId) {
-      if (ticket.requestId !== pending.requestId) aliasActivationRequest(pending.requestId, ticket.requestId);
-      pending.requestId = ticket.requestId;
-    }
+    const meta = await app.ActivateTopic(scope, workspaceRoot, topicId, sessionPath);
     if (!navigationCompletionCurrent(navigationSeq, "topic.activate", meta.id)) {
       // A newer navigation started while the backend processed this
       // activation. Applying the stale result would flip the visible tab
@@ -4400,39 +4164,30 @@ export function useController() {
       // prune below deletes every other tab's cached state, blanking the
       // surface the user is actually looking at. Last click wins: hand the
       // meta back for bookkeeping and leave the visible state to the newer
-      // navigation. The backend supersedes this ticket (its terminal event
-      // is ignored above: the pending slot belongs to the newer request).
+      // navigation.
       await reassertVisibleTabAfterStaleNavigation("topic.activate", meta.id);
       return meta;
     }
     // Save previous tab's items so the new tab can use them as a placeholder
     // during loading, avoiding a blank/Welcome flash before history arrives.
     const prevItems = activeTabIdRef.current ? statesRef.current.get(activeTabIdRef.current)?.items : undefined;
-    pending.placeholderItems = prevItems;
     for (const id of Array.from(statesRef.current.keys())) {
       if (id !== meta.id) {
         invalidateProviderStateForTab(id);
         disposeComposerProfileState(id);
         statesRef.current.delete(id);
-        releaseTranscriptState(id);
       }
     }
     setActiveTabId(meta.id);
     activeTabIdRef.current = meta.id;
     confirmBackendActiveTab(meta.id);
-    noteActivationStarted(pending.requestId, meta.id);
     dispatchTo(meta.id, { type: "optimistic_meta", meta: metaFromTab(meta, statesRef.current.get(meta.id)?.meta) });
     dispatchRuntimeStatusForTab(meta.id, meta, snapshotAt);
-    // The hydrate is driven by the activation's terminal "ready" event; until
-    // then keep the loading surface up with the previous tab's items as the
-    // placeholder (same no-flash behavior the immediate hydrate had).
-    dispatchTo(meta.id, { type: "hydrate_start", reason: "open-topic", placeholderItems: prevItems });
-    if (pending.terminal && pendingTopicActivationRef.current === pending) {
-      // The terminal event beat the ticket resolution; process it now.
-      handleTopicActivationEvent(pending.terminal);
-    }
+    void loadSessionDataForTab(meta.id, true, "open-topic", { placeholderItems: prevItems })
+      .then(() => reconcileTabRuntime(meta.id, { hydrateSessionData: false }))
+      .catch(() => {});
     return meta;
-  }, [beginActiveNavigation, confirmBackendActiveTab, dispatchRuntimeStatusForTab, dispatchTo, disposeComposerProfileState, handleTopicActivationEvent, invalidateProviderStateForTab, navigationCompletionCurrent, reassertVisibleTabAfterStaleNavigation, releaseTranscriptState]);
+  }, [beginActiveNavigation, confirmBackendActiveTab, dispatchRuntimeStatusForTab, dispatchTo, disposeComposerProfileState, invalidateProviderStateForTab, loadSessionDataForTab, navigationCompletionCurrent, reassertVisibleTabAfterStaleNavigation, reconcileTabRuntime]);
 
   // Ensure a blank tab exists for the given scope — reuses an existing one
   // or creates a new tab, then loads its session data.
@@ -4473,7 +4228,6 @@ export function useController() {
         invalidateProviderStateForTab(id);
         disposeComposerProfileState(id);
         statesRef.current.delete(id);
-        releaseTranscriptState(id);
       }
     }
     setActiveTabId(meta.id);
@@ -4485,7 +4239,7 @@ export function useController() {
       .then(() => reconcileTabRuntime(meta.id, { hydrateSessionData: false }))
       .catch(() => {});
     return meta;
-  }, [beginActiveNavigation, confirmBackendActiveTab, dispatchRuntimeStatusForTab, dispatchTo, disposeComposerProfileState, invalidateProviderStateForTab, loadSessionDataForTab, navigationCompletionCurrent, reassertVisibleTabAfterStaleNavigation, reconcileTabRuntime, releaseTranscriptState]);
+  }, [beginActiveNavigation, confirmBackendActiveTab, dispatchRuntimeStatusForTab, dispatchTo, disposeComposerProfileState, invalidateProviderStateForTab, loadSessionDataForTab, navigationCompletionCurrent, reassertVisibleTabAfterStaleNavigation, reconcileTabRuntime]);
 
   const createDeliveryWorktree = useCallback(async (workspaceRoot: string, navigationIntentSeq?: number): Promise<DeliveryWorktreeOpenResult> => {
     const navigationSeq = navigationIntentSeq ?? beginActiveNavigation();
@@ -4518,7 +4272,6 @@ export function useController() {
       invalidateProviderStateForTab(tabId);
       disposeComposerProfileState(tabId);
       statesRef.current.delete(tabId);
-      releaseTranscriptState(tabId);
       notifyLiveListeners(tabId);
       bump();
       if (tabId === activeTabId) await syncActiveTabFromBackend(false);
@@ -4526,7 +4279,7 @@ export function useController() {
     } catch {
       return false;
     }
-  }, [activeTabId, beginActiveNavigation, bump, disposeComposerProfileState, invalidateProviderStateForTab, notifyLiveListeners, releaseTranscriptState, syncActiveTabFromBackend]);
+  }, [activeTabId, beginActiveNavigation, bump, disposeComposerProfileState, invalidateProviderStateForTab, notifyLiveListeners, syncActiveTabFromBackend]);
 
   const reorderTabs = useCallback(async (tabIds: string[]) => {
     try {
@@ -4543,7 +4296,6 @@ export function useController() {
     setCollaborationMode, setCollaborationModeForTab, setToolApprovalMode, setToolApprovalModeForTab, setComposerProfileForTab, setGoal, setGoalForTab, clearGoal, clearGoalForTab, resumeGoal, resumeGoalForTab, pauseGoal, pauseGoalForTab,
     newSession, clearSession, listSessions, listTrashedSessions, resumeSession, openChannelSession, previewSession, deleteSession, restoreSession, purgeTrashedSession, renameSession,
     loadOlderHistory,
-    requestHistoryFullContent,
     refreshMeta, pickWorkspace, switchWorkspace, compact, rewind, rewindForTab, rewindForTabDetailed, undoRewindForTab, setModel, setEffort, setTokenMode, cancelJob,
     fetchMemory, remember, forget, saveDoc,
     switchTab, openProjectTab, openGlobalTab, openTopicSession, ensureBlankTab, activateTopic, ensureBlankSurface, createDeliveryWorktree, closeTab, reorderTabs,
