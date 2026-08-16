@@ -18,10 +18,9 @@ type catalogInspection struct {
 }
 
 type catalogCommand struct {
-	name            string
-	path            func() string
-	reindex         func([]string) int
-	completionFlags []cliCompletionFlag
+	name    string
+	path    func() string
+	reindex func([]string) int
 }
 
 var catalogCommands []catalogCommand
