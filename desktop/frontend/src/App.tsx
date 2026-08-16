@@ -120,7 +120,6 @@ import {
 import type { InvocationMetadataMap, StructuredInvocationSubmit } from "./lib/invocationDisplay";
 import { formatSelectionReference, type SelectedTextInsertRequest } from "./lib/selectedTextContext";
 import { workspaceTreeVisitId } from "./lib/workspaceTreeMemory";
-import { reconcileWorkspaceRefresh } from "./lib/workspaceRefreshStore";
 import { resolveTaskMonitorSession } from "./lib/taskMonitorNavigation";
 import {
   composerProfileFromMeta,
@@ -2615,7 +2614,7 @@ export default function App() {
       if (timer !== undefined) window.clearTimeout(timer);
       timer = undefined;
       void refreshTabMetas();
-      if (activeTabId) void reconcileWorkspaceRefresh(activeTabId, workspaceScopeKey);
+      if (activeTabId) void import("./lib/workspaceRefreshStore").then(({ reconcileWorkspaceRefresh }) => reconcileWorkspaceRefresh(activeTabId, workspaceScopeKey)).catch(() => undefined);
       schedule();
     };
     const onVisibilityChange = () => {
