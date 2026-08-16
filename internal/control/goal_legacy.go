@@ -7,9 +7,10 @@ import (
 )
 
 type legacyGoalRestore struct {
-	taskID string
-	todos  []evidence.TodoItem
-	epoch  uint64
+	taskID   string
+	todos    []evidence.TodoItem
+	epoch    uint64
+	explicit bool
 }
 
 func normalizeBudgetClass(goal, class string, legacyMode GoalResearchMode) string {
@@ -17,25 +18,24 @@ func normalizeBudgetClass(goal, class string, legacyMode GoalResearchMode) strin
 	case budgetClassSimple, budgetClassWrite, budgetClassResearch:
 		return class
 	default:
-		if strings.TrimSpace(goal) == "" && legacyMode != GoalResearchOn {
-			return ""
-		}
 		return budgetClassForLegacyMode(goal, legacyMode)
 	}
 }
 
 func goalStateNeedsMigration(state goalState, normalizedBudgetClass string) bool {
-	expectedMode := GoalResearchOff
+	expectedMode := GoalResearchAuto
 	if strings.TrimSpace(state.AutoResearchTaskID) != "" {
 		expectedMode = GoalResearchOn
+	} else if strings.TrimSpace(state.Goal) != "" {
+		expectedMode = GoalResearchOff
 	}
 	return state.TokensLimit != 0 || state.ResearchMode != expectedMode ||
 		(state.BudgetClass != "" && state.BudgetClass != normalizedBudgetClass)
 }
 
 // blockLegacyRestore fails closed only while the decoded sidecar still owns the
-// active Goal epoch. The task id remains durable so a later resume can retry.
-func (g *goalMachine) blockLegacyRestore(expectedEpoch uint64, taskID, reason string) (uint64, bool) {
+// active Goal epoch. The task id remains in the Controller's legacy reader.
+func (g *goalMachine) blockLegacyRestore(expectedEpoch uint64, reason string) (uint64, bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.continuationEpoch != expectedEpoch {
@@ -44,36 +44,17 @@ func (g *goalMachine) blockLegacyRestore(expectedEpoch uint64, taskID, reason st
 	g.status = GoalStatusBlocked
 	g.stopCause = stopCauseLegacyArchive
 	g.block = clipGoalReason(reason)
-	g.pendingLegacyTaskID = strings.TrimSpace(taskID)
 	g.continuationEpoch++
 	return g.continuationEpoch, true
 }
 
-// failLegacyRestorePersistence keeps a recovered archive retryable when the
-// sidecar replacement fails. The recovered Goal text may remain in memory, but
-// the Goal stays fail-closed and the legacy task id is retained until a later
-// resume commits the migration durably.
-func (g *goalMachine) failLegacyRestorePersistence(expectedEpoch uint64, taskID, reason string) (uint64, bool) {
+func (g *goalMachine) legacyArchiveRetryToken(expectedEpoch uint64) (goal string, ok bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if g.continuationEpoch != expectedEpoch {
-		return 0, false
+	if g.continuationEpoch != expectedEpoch || g.status != GoalStatusBlocked || g.stopCause != stopCauseLegacyArchive {
+		return "", false
 	}
-	g.status = GoalStatusBlocked
-	g.stopCause = stopCauseLegacyArchive
-	g.block = clipGoalReason(reason)
-	g.pendingLegacyTaskID = strings.TrimSpace(taskID)
-	g.continuationEpoch++
-	return g.continuationEpoch, true
-}
-
-func (g *goalMachine) legacyArchiveRetryToken() (goal, taskID string, epoch uint64, ok bool) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if g.status != GoalStatusBlocked || g.stopCause != stopCauseLegacyArchive || g.pendingLegacyTaskID == "" {
-		return "", "", 0, false
-	}
-	return g.goal, g.pendingLegacyTaskID, g.continuationEpoch, true
+	return g.goal, true
 }
 
 func (g *goalMachine) legacyArchiveBlockedState() (goal string, epoch uint64, ok bool) {
@@ -126,7 +107,6 @@ func (g *goalMachine) fillGoalTextIfEmpty(expectedEpoch uint64, goal string) (ui
 		return 0, false
 	}
 	g.goal = goal
-	g.pendingLegacyTaskID = ""
 	if g.status == "" || g.stopCause == stopCauseLegacyArchive {
 		g.status = GoalStatusRunning
 	}
@@ -164,7 +144,6 @@ func (g *goalMachine) resumeLegacyArchive(expectedEpoch uint64, goal string) (ui
 	g.goal = goal
 	g.status = GoalStatusRunning
 	g.stopCause, g.block = "", ""
-	g.pendingLegacyTaskID = ""
 	g.budgetClass = budgetClassResearch
 	if g.turnsLimit < budgetQuota(g.budgetClass) {
 		g.turnsLimit = budgetQuota(g.budgetClass)
