@@ -1422,11 +1422,15 @@ func (a *Agent) Run(ctx context.Context, input string) (runErr error) {
 	runMaxSteps := a.maxSteps
 	runMaxStepsKey := a.maxStepsKey
 	runLimitHostOwned := false
+	runPauseAfterFinal := false
 	if limit, ok := runStepLimitFromContext(ctx); ok {
-		runMaxSteps = limit.steps
-		runLimitHostOwned = true
-		if limit.key != "" {
-			runMaxStepsKey = limit.key
+		if !limit.defaultOnly || a.maxSteps <= 0 {
+			runMaxSteps = limit.steps
+			runLimitHostOwned = true
+			runPauseAfterFinal = limit.pauseAfterFinal
+			if limit.key != "" {
+				runMaxStepsKey = limit.key
+			}
 		}
 	}
 	a.recoveryRunSeq.Add(1)
@@ -1479,6 +1483,7 @@ func (a *Agent) Run(ctx context.Context, input string) (runErr error) {
 	state.runMaxSteps = runMaxSteps
 	state.runMaxStepsKey = runMaxStepsKey
 	state.runLimitHostOwned = runLimitHostOwned
+	state.runPauseAfterFinal = runPauseAfterFinal
 	state.workDurationMs = workDurationMs
 	return a.runToolLoop(ctx, state)
 }
@@ -1577,12 +1582,26 @@ func (a *Agent) observeMissingToolCallReasoning(calls []provider.ToolCall, reaso
 // treats planner research budgets specially: ordinary plan-and-execute work
 // falls back to the executor, while explicit execution boundaries fail closed.
 type maxStepsPause struct {
-	steps int
-	key   string
+	steps     int
+	key       string
+	hostOwned bool
 }
 
 func (e *maxStepsPause) Error() string {
 	return fmt.Sprintf("paused after %d tool-call rounds (%s) — the work so far is saved; send another message to continue, or set %s higher or to 0 for no limit", e.steps, e.key, e.key)
+}
+
+type goalStuckPause struct {
+	limit  int
+	key    string
+	reason string
+}
+
+func (e *goalStuckPause) Error() string {
+	if e == nil || strings.TrimSpace(e.reason) == "" {
+		return "goal paused after a structural no-progress loop; completed work is saved"
+	}
+	return "goal paused after a structural no-progress loop: " + e.reason
 }
 
 type todoStallPause struct {
@@ -1596,7 +1615,8 @@ func (e *todoStallPause) Error() string {
 func isToolLoopPause(err error) bool {
 	var maxPause *maxStepsPause
 	var stallPause *todoStallPause
-	return errors.As(err, &maxPause) || errors.As(err, &stallPause)
+	var stuckPause *goalStuckPause
+	return errors.As(err, &maxPause) || errors.As(err, &stallPause) || errors.As(err, &stuckPause)
 }
 
 // ReadinessResult is the host-consumable outcome of the Delivery final-answer
@@ -1631,17 +1651,15 @@ func (a *Agent) ReadinessResult() ReadinessResult {
 	}
 }
 
-// HostProgressSignature returns a compact signature of host-observable progress
-// across the current delivery scope: successful writes, commands, todo writes,
-// signoffs, and reviews. Identical signatures across consecutive goal turns
-// mean no host-verifiable progress was made — reads, reworded answers, and
-// repeated continue reasons never reset the stall counter.
-func (a *Agent) HostProgressSignature() string {
+// HostProgressSignatures returns the host-observed evidence identities for the
+// current delivery scope. The Goal FSM owns the cross-turn novelty set: a new
+// read/result, mutation, task-state transition, or review advances the Goal,
+// while an exact successful replay does not.
+func (a *Agent) HostProgressSignatures() []string {
 	if a == nil || a.evidence == nil {
-		return ""
+		return nil
 	}
-	s := a.evidence.ReceiptProgressSummary()
-	return fmt.Sprintf("w=%d;c=%d;t=%d;s=%d;r=%d", s.Writes, s.Commands, s.Todos, s.Signoffs, s.Reviews)
+	return a.evidence.SuccessfulProgressSignaturesSince(0)
 }
 
 type finalReadinessCheck struct {
@@ -2829,7 +2847,7 @@ const loopGuardBlockErrMsg = "blocked by loop guard"
 // blocker (see loopGuardAllowsFinal). The hard maxSteps guard remains the
 // ultimate backstop; this just keeps the loop from burning that whole budget
 // bouncing off the same host refusals.
-func (a *Agent) applyStormBreaker(calls []provider.ToolCall, outcomes []toolOutcome, results []string, receiptMark int) {
+func (a *Agent) applyStormBreaker(calls []provider.ToolCall, outcomes []toolOutcome, results []string, receiptMark int) string {
 	allBlocked := len(outcomes) > 0
 	for _, outcome := range outcomes {
 		if !outcome.blocked {
@@ -2861,7 +2879,7 @@ func (a *Agent) applyStormBreaker(calls []provider.ToolCall, outcomes []toolOutc
 	stormHit := ok && a.stormCount >= stormBreakThreshold
 	streakHit := allBlocked && a.blockedTurnStreak >= stormBreakThreshold
 	if !stormHit && !streakHit {
-		return
+		return ""
 	}
 
 	const blockedAdvice = "Change approach: do not keep retrying a blocked tool by changing the tool, command, or arguments. Respect the permission, plan-mode, hook, or loop-guard blocker; use an already-allowed tool, ask the user for the specific approval or choice if appropriate, or explain the blocker in your final answer."
@@ -2903,6 +2921,7 @@ func (a *Agent) applyStormBreaker(calls []provider.ToolCall, outcomes []toolOutc
 	results[0] = outcomes[0].output + "\n\n" + guard
 	a.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelInfo, Code: event.NoticeCodeLoopGuard, Text: loopGuardNoticeText(), Detail: detail})
 	a.armLoopGuardPass(receiptMark)
+	return detail
 }
 
 func loopGuardNoticeText() string {
