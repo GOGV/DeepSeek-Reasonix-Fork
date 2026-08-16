@@ -2846,6 +2846,8 @@ export const en = {
   "turnActions.summary": "Compress",
   "turnActions.rewind": "Rewind",
   "transcript.jumpToBottom": "Jump to bottom",
+  "markdown.tableExpandAll": "Expand all {n} rows",
+  "markdown.tableCollapse": "Collapse table",
   "transcript.showEarlierHistory": "Show {n} earlier turns",
   "transcript.toolCount": "{n} tools",
   "transcript.thoughtCount": "{n} thoughts",
