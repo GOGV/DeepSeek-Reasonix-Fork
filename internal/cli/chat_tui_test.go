@@ -3149,9 +3149,7 @@ func TestForceGotoBottomScrollsWithoutTranscriptChange(t *testing.T) {
 	if cur.forceGotoBottom {
 		t.Fatal("forceGotoBottom should be cleared after scrolling")
 	}
-	if cmd == nil {
-		t.Fatal("regular forceGotoBottom scroll jump should request ClearScreen")
-	}
+	assertLegacyViewportClearCmd(t, cmd)
 }
 
 func TestSessionSwitchSuppressesOneClearScreen(t *testing.T) {
@@ -3194,9 +3192,7 @@ func TestSessionSwitchSuppressesOneClearScreen(t *testing.T) {
 	cur = next(cur, tea.MouseWheelMsg{Button: tea.MouseWheelUp})
 	cur.forceGotoBottom = true
 	cur, cmd = adv(cur, tea.WindowSizeMsg{Width: 80, Height: 8})
-	if cmd == nil {
-		t.Fatal("later scroll jumps must still request ClearScreen")
-	}
+	assertLegacyViewportClearCmd(t, cmd)
 	if cur.sessionSwitch {
 		t.Fatal("sessionSwitch should remain false after the suppressed cycle")
 	}
