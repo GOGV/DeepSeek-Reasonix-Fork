@@ -406,14 +406,15 @@ reasonix sessions reindex --dir /path/to/sessions --dir /another/path
 不传 `--dir` 时，reindex 会覆盖全局会话和桌面保存的全部项目。迁移、失败降级和数据安全
 契约见 [Session Catalog and Desktop Startup](./SESSION_CATALOG.md)。
 
-用量统计使用独立的可丢弃 rollup 投影：
+可以独立检查或重建可丢弃的 Task 投影：
 
 ```sh
 reasonix doctor catalogs [--json]
-reasonix catalogs reindex usage [--json]
+reasonix catalogs reindex tasks [--project PATH ...] [--json]
 ```
 
-详见 [用量 Catalog](./USAGE_CATALOG.zh-CN.md)。
+权威 FileStore 边界、跨项目路由和重建行为见
+[Task Catalog](./TASK_CATALOG.zh-CN.md)。
 
 ### 记忆诊断与恢复
 
