@@ -4763,8 +4763,8 @@ export default function App() {
                   className={`topicbar__action-btn topicbar__action-btn--icon topicbar__action-btn--utility${tasksOpen ? " topicbar__action-btn--active" : ""}`}
                   type="button"
                   aria-label={t("summary.session")}
-                  aria-expanded={tasksOpen}
-                  onClick={() => setTasksOpen((open) => !open)}
+                  aria-expanded={Boolean(tasksOpen)}
+                  onClick={() => setTasksOpen((open) => open ? false : "session")}
                 >
                   <Activity size={14} />
                 </button>

@@ -1951,6 +1951,7 @@ func (a *App) buildSettingReplacementController(tab *WorkspaceTab, snap tabRunti
 		Model: model, RequireKey: false,
 		RuntimeReload:            boot.RuntimeReload{ForceFullRebuild: reload},
 		StatsSource:              "desktop",
+		TaskStore:                a.taskStore(),
 		OnConfigLoadWarnings:     a.configLoadWarningsHandler(),
 		Sink:                     snap.sink,
 		WorkspaceRoot:            snap.workspaceRoot,
