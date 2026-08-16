@@ -22,6 +22,7 @@ import (
 	"reasonix/internal/extension/providerext"
 	"reasonix/internal/fileutil"
 	"reasonix/internal/notify"
+	"reasonix/internal/plugin"
 	"reasonix/internal/provider"
 	"reasonix/internal/store"
 	"reasonix/internal/worktree"
@@ -2193,7 +2194,6 @@ type TabMeta struct {
 	CollaborationMode string             `json:"collaborationMode"`
 	ToolApprovalMode  string             `json:"toolApprovalMode"`
 	TokenMode         string             `json:"tokenMode"`
-	AgentPreset       string             `json:"agentPreset,omitempty"`
 	Goal              string             `json:"goal,omitempty"`
 	GoalStatus        string             `json:"goalStatus,omitempty"`
 	Recovered         bool               `json:"recovered,omitempty"`
@@ -2249,7 +2249,6 @@ func (a *App) tabMeta(tab *WorkspaceTab, active bool) TabMeta {
 		Mode:              currentTabMode(tab),
 		CollaborationMode: currentTabCollaborationMode(tab),
 		ToolApprovalMode:  currentTabToolApprovalMode(tab),
-		AgentPreset:       boot.NormalizeAgentPreset(currentTabTokenMode(tab)),
 		TokenMode:         currentTabTokenMode(tab),
 		Goal:              currentTabGoal(tab),
 		GoalStatus:        currentTabGoalStatus(tab),
@@ -3900,28 +3899,54 @@ func (a *App) buildTabControllerWithContextCore(tab *WorkspaceTab, loadedSession
 	// resurrecting removed tools on the shared host.
 	extensionGen := a.currentExtensionGeneration()
 	sharedHost := a.acquireSharedHost(rootKey)
-	beforeMCP := sharedHostServerSnapshot(sharedHost)
 	sink := a.desktopControllerSink(buildSink, cfg.Notifications)
-	ctrl, err := boot.Build(buildCtx, boot.Options{
-		Model:                    model,
-		RequireKey:               false,
-		AutoPricingCurrency:      a.desktopAutoPricingCurrency(),
-		StatsSource:              "desktop",
-		TaskStore:                a.taskStore(),
-		Sink:                     sink,
-		WorkspaceRoot:            root,
-		SessionDir:               sessionDir,
-		EffortOverride:           cloneStringPtr(buildEffort),
-		AgentPreset:              boot.NormalizeAgentPreset(buildTokenMode),
-		TokenMode:                buildTokenMode,
-		SharedHost:               sharedHost,
-		CleanupPendingReconciler: reconcileDesktopCleanupPending,
-		SubagentParentLive:       a.subagentParentProbeForBuild(tab),
-		SessionRecoveryMeta:      a.tabSessionRecoveryMeta(tab),
-		OnSessionRecovered:       a.handleTabSessionRecovered(tab),
-	})
+	// Journal Host client instances this build registers so generation-loss
+	// rollback can RemoveIfInstance only those instances, never sibling/new
+	// generation clients that merely share a server name.
+	var ctrl control.SessionAPI
+	var registered []plugin.HostClientRef
+	if sharedHost != nil {
+		registered, _ = sharedHost.RunWithRegistrationJournal(func() error {
+			ctrl, err = boot.Build(buildCtx, boot.Options{
+				Model:                    model,
+				RequireKey:               false,
+				AutoPricingCurrency:      a.desktopAutoPricingCurrency(),
+				StatsSource:              "desktop",
+				TaskStore:                a.taskStore(),
+				Sink:                     sink,
+				WorkspaceRoot:            root,
+				SessionDir:               sessionDir,
+				EffortOverride:           cloneStringPtr(buildEffort),
+				TokenMode:                buildTokenMode,
+				SharedHost:               sharedHost,
+				CleanupPendingReconciler: reconcileDesktopCleanupPending,
+				SubagentParentLive:       a.subagentParentProbeForBuild(tab),
+				SessionRecoveryMeta:      a.tabSessionRecoveryMeta(tab),
+				OnSessionRecovered:       a.handleTabSessionRecovered(tab),
+			})
+			return nil
+		})
+	} else {
+		ctrl, err = boot.Build(buildCtx, boot.Options{
+			Model:                    model,
+			RequireKey:               false,
+			AutoPricingCurrency:      a.desktopAutoPricingCurrency(),
+			StatsSource:              "desktop",
+			TaskStore:                a.taskStore(),
+			Sink:                     sink,
+			WorkspaceRoot:            root,
+			SessionDir:               sessionDir,
+			EffortOverride:           cloneStringPtr(buildEffort),
+			TokenMode:                buildTokenMode,
+			SharedHost:               sharedHost,
+			CleanupPendingReconciler: reconcileDesktopCleanupPending,
+			SubagentParentLive:       a.subagentParentProbeForBuild(tab),
+			SessionRecoveryMeta:      a.tabSessionRecoveryMeta(tab),
+			OnSessionRecovered:       a.handleTabSessionRecovered(tab),
+		})
+	}
 	if err != nil {
-		rollbackSharedHostMCPCreatedByBuild(sharedHost, beforeMCP)
+		rollbackSharedHostMCPRegistration(sharedHost, registered)
 		leaseHeld := false
 		a.mu.Lock()
 		if a.tabBuildSupersededLocked(tab, buildGeneration) {
@@ -3949,12 +3974,12 @@ func (a *App) buildTabControllerWithContextCore(tab *WorkspaceTab, loadedSession
 		return
 	}
 	if a.tabBuildSuperseded(tab, buildGeneration) {
-		rollbackSharedHostMCPCreatedByBuild(sharedHost, beforeMCP)
+		rollbackSharedHostMCPRegistration(sharedHost, registered)
 		a.abandonSupersededBuild(tab, ctrl, rootKey, "")
 		return
 	}
 	if a.currentExtensionGeneration() != extensionGen {
-		rollbackSharedHostMCPCreatedByBuild(sharedHost, beforeMCP)
+		rollbackSharedHostMCPRegistration(sharedHost, registered)
 		a.abandonSupersededBuild(tab, ctrl, rootKey, "")
 		a.scheduleDeferredStartupBuild(tab.ID)
 		return
@@ -4935,7 +4960,6 @@ type desktopTabEntry struct {
 	Model            string  `json:"model,omitempty"`
 	Effort           *string `json:"effort,omitempty"`
 	TokenMode        string  `json:"tokenMode,omitempty"`
-	AgentPreset      string  `json:"agentPreset,omitempty"`
 	Mode             string  `json:"mode,omitempty"`
 	Goal             string  `json:"goal,omitempty"`
 	ToolApprovalMode string  `json:"toolApprovalMode,omitempty"`
@@ -4999,7 +5023,6 @@ func (a *App) saveTabsCollectLocked() (string, []desktopTabEntry, string, uint64
 				Model:            tab.model,
 				Effort:           cloneStringPtr(tab.effort),
 				TokenMode:        persistedTabTokenMode(currentTabTokenMode(tab)),
-				AgentPreset:      boot.NormalizeAgentPreset(currentTabTokenMode(tab)),
 				Mode:             persistedTabMode(currentTabMode(tab)),
 				Goal:             persistedTabGoal(tab),
 				ToolApprovalMode: persistedToolApprovalMode(currentTabToolApprovalMode(tab)),
@@ -6213,7 +6236,6 @@ func (a *App) tabSessionRecoveryMeta(tab *WorkspaceTab) func(control.SessionReco
 			TopicID:          topicID,
 			TopicTitle:       topicTitle,
 			Model:            model,
-			AgentPreset:      boot.NormalizeAgentPreset(tokenMode),
 			TokenMode:        tokenMode,
 			Mode:             persistedTabMode(mode),
 			ToolApprovalMode: persistedToolApprovalMode(toolApprovalMode),
@@ -8522,12 +8544,7 @@ func defaultTabSessionProfile() tabSessionProfile {
 
 func tabSessionProfileFromMeta(sessionPath string, meta agent.BranchMeta) tabSessionProfile {
 	profile := defaultTabSessionProfile()
-	// Prefer agent_preset; fall back to legacy token_mode for one version.
-	if strings.TrimSpace(meta.AgentPreset) != "" {
-		profile.tokenMode = boot.TokenModeFromAgentPreset(meta.AgentPreset)
-	} else {
-		profile.tokenMode = boot.NormalizeTokenMode(meta.TokenMode)
-	}
+	profile.tokenMode = boot.NormalizeTokenMode(meta.TokenMode)
 	profile.mode = normalizeTabMode(meta.Mode)
 	profile.toolApprovalMode = normalizeToolApprovalMode(meta.ToolApprovalMode)
 	if profile.toolApprovalMode == control.ToolApprovalAsk && tabModeHasAutoApproveTools(meta.Mode) {
