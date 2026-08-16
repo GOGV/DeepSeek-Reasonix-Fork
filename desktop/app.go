@@ -8443,10 +8443,6 @@ func skillRootsCacheKey(workspaceRoot string, cfg, userCfg *config.Config) strin
 	return string(b)
 }
 
-func canonicalSkillPaths(paths []string) []string {
-	return canonicalSkillPathsForRoot(paths, ".")
-}
-
 func canonicalSkillPathsForRoot(paths []string, workspaceRoot string) []string {
 	out := make([]string, 0, len(paths))
 	for _, p := range paths {
