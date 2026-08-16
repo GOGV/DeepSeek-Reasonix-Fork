@@ -117,13 +117,14 @@ func (o *turnOrchestrator) runSubagentSkillTurns(ctx context.Context, skills []s
 
 	input := c.compose(task, raw, true)
 	startMessages := c.messageCount()
-	defer c.snapshotActivityIfChanged(startMessages)
+	var marker agent.InFlightTurnMeta
+	defer func() { c.finishInFlightTurn(startMessages, marker) }()
 	defer c.recordDisplayForNewUser(startMessages, display)
 	// The checkpoint prompt labels the turn in the rewind picker (and is
 	// prefilled into the composer after a conversation rewind), so it must be
 	// the user's own text — never the composed provider input with its
 	// transient <response-language>/<reasoning-language>/memory/hook blocks.
-	c.beginCheckpoint(firstNonEmpty(raw, task))
+	c.beginCheckpoint(ctx, firstNonEmpty(raw, task))
 	if c.guardianSess != nil {
 		c.guardianSess.ResetTurn()
 	}
@@ -138,13 +139,7 @@ func (o *turnOrchestrator) runSubagentSkillTurns(ctx context.Context, skills []s
 		defer func() { c.hooks.StopResult(context.Background(), lastAssistantText(c.History()), turn, err) }()
 	}
 
-	c.markInFlightTurn(startMessages, true)
-	inFlight := true
-	defer func() {
-		if inFlight {
-			c.clearInFlightTurn()
-		}
-	}()
+	marker = c.markInFlightTurn(startMessages, true)
 	c.sink.Emit(event.Event{Kind: event.TurnStarted})
 	if c.executor == nil {
 		return fmt.Errorf("subagent slash invocation requires an active session")
@@ -182,8 +177,6 @@ func (o *turnOrchestrator) runSubagentSkillTurns(ctx context.Context, skills []s
 		c.sink.Emit(event.Event{Kind: event.Message, Text: display})
 	}
 
-	c.clearInFlightTurn()
-	inFlight = false
 	return nil
 }
 
@@ -222,7 +215,8 @@ func (o *turnOrchestrator) runOrchestratedTurn(ctx context.Context, turn orchest
 		return nil
 	}
 	startMessages := c.messageCount()
-	defer c.snapshotActivityIfChanged(startMessages)
+	var marker agent.InFlightTurnMeta
+	defer func() { c.finishInFlightTurn(startMessages, marker) }()
 	defer c.recordDisplayForNewUser(startMessages, turn.display)
 	if turn.editedOriginal != "" {
 		defer c.markEditedForNewUser(startMessages, turn.editedOriginal)
@@ -236,7 +230,7 @@ func (o *turnOrchestrator) runOrchestratedTurn(ctx context.Context, turn orchest
 	// composed provider input carries transient prefab blocks that must never
 	// surface in the rewind picker or be prefilled into the composer.
 	if !turn.synthetic {
-		c.beginCheckpoint(firstNonEmpty(turn.raw, turn.input))
+		c.beginCheckpoint(ctx, firstNonEmpty(turn.raw, turn.input))
 	}
 	if c.guardianSess != nil {
 		c.guardianSess.ResetTurn()
@@ -254,7 +248,7 @@ func (o *turnOrchestrator) runOrchestratedTurn(ctx context.Context, turn orchest
 		}
 		defer func() { c.hooks.StopResult(context.Background(), lastAssistantText(c.History()), turn, err) }()
 	}
-	c.markInFlightTurn(startMessages, !turn.synthetic && !IsSyntheticUserMessage(turn.raw))
+	marker = c.markInFlightTurn(startMessages, !turn.synthetic && !IsSyntheticUserMessage(turn.raw))
 	if continuation != nil {
 		ctx = agent.WithDeliveryExecutionScope(ctx, agent.DeliveryExecutionScope{
 			ID:       continuation.scopeID,
@@ -289,9 +283,7 @@ func (o *turnOrchestrator) runOrchestratedTurn(ctx context.Context, turn orchest
 	}
 	err = c.runner.Run(ctx, modelInput)
 	c.persistGoalDeliveryCheckpoint()
-	if err == nil {
-		c.clearInFlightTurn()
-	} else {
+	if err != nil {
 		// When the user explicitly cancels, keep the real prompt and any fully
 		// paired tool work. Partial reasoning/output remains durable for display
 		// but is marked local-only, and a bounded recovery summary is folded into
@@ -320,7 +312,6 @@ func (o *turnOrchestrator) runOrchestratedTurn(ctx context.Context, turn orchest
 				CreatedAt: time.Now().UnixMilli(),
 			})
 		}
-		c.clearInFlightTurn()
 		return err
 	}
 	c.mu.Lock()
@@ -356,8 +347,8 @@ func (o *turnOrchestrator) runOrchestratedTurn(ctx context.Context, turn orchest
 	c.approval.setPlanAutoApprove(true)
 	defer c.approval.setPlanAutoApprove(false)
 	err = func() error {
-		c.markInFlightTurn(execStart, false)
-		defer c.clearInFlightTurn()
+		marker := c.markInFlightTurn(execStart, false)
+		defer c.finishInFlightTurn(execStart, marker)
 		return o.runComposedSyntheticTurn(ctx, planApprovedMessage)
 	}()
 	if err != nil {
