@@ -1,11 +1,9 @@
 // Wire contract — mirrors desktop/wire.go (itself mirroring internal/serve/wire.go).
 // One event channel carries every kind; `kind` discriminates the payload.
-
 import type { Todo } from "./tools";
 import type { ContextMaintenanceInfo, WireContextMaintenance } from "./contextMaintenanceTypes";
 export type { ContextMaintenanceInfo, ContextMaintenanceReceipt, WireContextMaintenance } from "./contextMaintenanceTypes";
 export type { ProjectTopicKey, ProjectTopicPage, ProjectTopicPageRequest, ProjectTreeChangedV2, ProjectTreeSnapshot, SessionCatalogBindings, SessionCatalogStatus, SessionReference } from "./sessionCatalogTypes";
-
 export type EventKind =
   | "turn_started"
   | "reasoning"
@@ -30,12 +28,8 @@ export type EventKind =
   | "extension_status"
   | "stream_attempt"
   | "context_maintenance"
-  | "workspace_changed"
-  | "turn_phase"
-  | "completion_summary";
-
+  | "workspace_changed";
 export type StreamAttemptAction = "begin" | "discard" | "commit";
-
 export interface WireStreamAttempt {
   id: string;
   action: StreamAttemptAction;
@@ -44,14 +38,12 @@ export interface WireStreamAttempt {
   /** Fixed enum only: connection_reset | premature_eof | idle_timeout */
   reason?: string;
 }
-
 export interface WireCompaction {
   trigger?: string; // "auto" | "manual"
   messages?: number; // done: how many messages were folded into the summary
   summary?: string; // done: the briefing (empty on an aborted pass)
   archive?: string; // done: archive path, if any
 }
-
 export interface WireProfile {
   model?: string;
   effort?: string;
@@ -313,11 +305,9 @@ export interface WireEvent {
   /** Optional: "headers" | "stream". Older clients ignore unknown fields. */
   retryScope?: "headers" | "stream";
   streamAttempt?: WireStreamAttempt;
+  /** Durable session-inbox item id for steer / TurnDone correlation. */
+  itemId?: string;
   workspace?: WireWorkspaceChanged;
-  /** turn_phase: working | checking | verifying | reviewing */
-  phase?: string;
-  /** completion_summary: content-free quality summary for role settings */
-  completion?: WireCompletionSummary;
   tabId?: string; // Go's tabEventSink tags events for the correct per-tab reducer.
   runtimeEpoch?: string;
   sessionHitTokens?: number;
@@ -326,18 +316,6 @@ export interface WireEvent {
   sessionCurrency?: string;
   // Deprecated compatibility alias. Prefer sessionCost + sessionCurrency.
   sessionCostUsd?: number;
-}
-
-export interface WireCompletionSummary {
-  preset: string;
-  verdict: string;
-  mutations: number;
-  checks_passed: number;
-  checks_failed: number;
-  checks_suppressed: number;
-  review: string;
-  gap_kinds?: string[];
-  constraint_degraded: boolean;
 }
 
 export type WorkspaceWatchState = "active" | "degraded" | "unavailable";
@@ -402,6 +380,7 @@ export interface TabMeta {
   sessionPath?: string;
   sessionRevision?: number;
   sessionDigest?: string;
+  sessionGeneration?: number;
   readOnly?: boolean;
   filePath?: string;
   projectColor?: string;
@@ -417,8 +396,6 @@ export interface TabMeta {
   collaborationMode?: CollaborationMode;
   toolApprovalMode?: ToolApprovalMode;
   tokenMode?: TokenMode;
-  /** Canonical role setting (light|balanced|delivery). Prefer over tokenMode. */
-  agentPreset?: AgentPreset;
   goal?: string;
   goalStatus?: GoalStatus;
   recovered?: boolean;
@@ -664,6 +641,8 @@ export interface HistoryEntry {
   refs: HistoryContentRef[];
 }
 
+export interface SessionClearResult { sessionPath: string; sessionRevision?: number; sessionDigest?: string; sessionGeneration: number }
+
 export interface HistorySlice {
   entries: HistoryEntry[];
   nextCursor: string; // toward older; empty when none
@@ -848,6 +827,7 @@ export interface Meta {
   sessionPath?: string;
   sessionRevision?: number;
   sessionDigest?: string;
+  sessionGeneration?: number;
   cwd: string;
   workspaceRoot?: string;
   workspaceName?: string;
@@ -859,8 +839,6 @@ export interface Meta {
   collaborationMode?: CollaborationMode;
   toolApprovalMode?: ToolApprovalMode;
   tokenMode?: TokenMode;
-  /** Canonical role setting (light|balanced|delivery). Prefer over tokenMode. */
-  agentPreset?: AgentPreset;
   goal?: string;
   goalStatus?: GoalStatus;
   goalRuntime?: GoalRuntime;
@@ -869,11 +847,8 @@ export interface Meta {
 
 export type CollaborationMode = "normal" | "plan" | "goal";
 export type ToolApprovalMode = "ask" | "auto" | "yolo";
-// TokenMode is the dual-write wire value for Agent role settings (角色设定).
-// Canonical product ids are light|balanced|delivery; economy/full remain one
-// compatibility version of persisted/API values.
-export type TokenMode = "full" | "economy" | "delivery" | "light" | "balanced";
-export type AgentPreset = "light" | "balanced" | "delivery";
+// "full" is the persisted compatibility value for the Balanced runtime profile.
+export type TokenMode = "full" | "economy" | "delivery";
 export type GoalStatus = "running" | "complete" | "blocked" | "stopped";
 // GoalRuntime is the optional Goal budget/runtime summary the backend attaches
 // to Meta. Absent for old hosts or when no goal is active.
@@ -912,30 +887,9 @@ export function normalizeToolApprovalMode(
 }
 
 export function normalizeTokenMode(mode?: string): TokenMode {
-  const m = (mode ?? "").trim().toLowerCase();
-  if (m === "economy" || m === "light" || m === "lite" || m === "eco") return "economy";
-  if (m === "delivery" || m === "deliver" || m === "quality") return "delivery";
-  // balanced | full | empty | unknown → balanced wire value "full"
+  if (mode === "economy") return "economy";
+  if (mode === "delivery") return "delivery";
   return "full";
-}
-
-/** Canonical product id for the three Agent role settings. */
-export function normalizeAgentPreset(mode?: string): AgentPreset {
-  const wire = normalizeTokenMode(mode);
-  if (wire === "economy" || wire === "light") return "light";
-  if (wire === "delivery") return "delivery";
-  return "balanced";
-}
-
-export function tokenModeFromAgentPreset(preset: AgentPreset): TokenMode {
-  switch (preset) {
-    case "light":
-      return "economy";
-    case "delivery":
-      return "delivery";
-    default:
-      return "full";
-  }
 }
 
 // Mode is the compatibility string for two independent composer axes:

@@ -198,7 +198,6 @@ export type HydrateReason = "switch-tab" | "new-session" | "resume-session" | "o
 type SyncActiveTabOptions = {
   preserveCachedHistory?: boolean;
 };
-
 // A ticketed StartTopicActivation in flight. Only the latest one is tracked:
 // superseded requests get "cancelled" from the backend and are ignored.
 type PendingTopicActivation = {
@@ -209,42 +208,22 @@ type PendingTopicActivation = {
   /** Terminal event that arrived before the ticket resolved. */
   terminal?: TopicActivationEvent;
 };
-
 type ModelSwitchQueueResult = "applied" | "superseded";
-
 type ModelSwitchQueueRequest = {
   name: string;
   resolve: (result: ModelSwitchQueueResult) => void;
   reject: (err: unknown) => void;
 };
-
 type ModelSwitchQueueState = {
   running: boolean;
   pending?: ModelSwitchQueueRequest;
   fallbackBalance?: BalanceInfo;
 };
-
 const HISTORY_PAGE_TURNS = 60;
-
-export type TurnPhaseName = "working" | "checking" | "verifying" | "reviewing" | string;
-
 export type Item =
   | { kind: "user"; id: string; submissionId?: string; text: string; submitText?: string; failed?: boolean; createdAt?: number; checkpointTurn?: number }
   | { kind: "assistant"; id: string; text: string; reasoning: string; streaming: boolean; reasoningComplete?: boolean; reasoningDurationMs?: number; workDurationMs?: number; memoryCitations?: MemoryCitation[] }
   | { kind: "phase"; id: string; text: string }
-  | {
-      kind: "completion_summary";
-      id: string;
-      preset: string;
-      verdict: string;
-      mutations: number;
-      checksPassed: number;
-      checksFailed: number;
-      checksSuppressed: number;
-      review: string;
-      gapKinds?: string[];
-      constraintDegraded: boolean;
-    }
   | { kind: "notice"; id: string; level: "info" | "warn"; text: string; detail?: string; title?: string; variant?: "delivery"; action?: "continue_delivery"; decisionReceipt?: WireDecisionReceipt }
   | {
       kind: "compaction";
@@ -290,10 +269,8 @@ export type Item =
       generation?: number;
       card: WireExtensionCard;
     };
-
 type ToolItem = Extract<Item, { kind: "tool" }>;
 export type ExtensionItem = Extract<Item, { kind: "extension" }>;
-
 // Extension UI surfaces (stage 8b2) — per-tab state fed by extension_surface /
 // extension_status wire events. Statuses and generations key on
 // "<pluginId>:<surfaceId>"; the form is the single pending form surface (a new
@@ -308,14 +285,12 @@ export interface ExtensionStatusEntry {
   progress?: number;
   generation?: number;
 }
-
 export interface ExtensionFormState {
   pluginId: string;
   surfaceId: string;
   generation?: number;
   form: WireExtensionForm;
 }
-
 export interface ExtensionNotificationEntry {
   id: string;
   pluginId: string;
@@ -323,13 +298,11 @@ export interface ExtensionNotificationEntry {
   body?: string;
   severity?: string;
 }
-
 // extensionSurfaceKey is the identity a sidecar re-publishes under to replace
 // one of its surfaces.
 export function extensionSurfaceKey(surface: Pick<WireExtensionSurface, "pluginId" | "surfaceId">): string {
   return `${surface.pluginId}:${surface.surfaceId}`;
 }
-
 // acceptsExtensionGeneration drops a re-ordered surface publication: within
 // one runtime, a sidecar's generation is monotonic, so anything older than the
 // last accepted generation for the same surface is stale. Events without a
@@ -337,17 +310,14 @@ export function extensionSurfaceKey(surface: Pick<WireExtensionSurface, "pluginI
 export function acceptsExtensionGeneration(stored: number | undefined, incoming: number | undefined): boolean {
   return incoming === undefined || stored === undefined || incoming >= stored;
 }
-
 // Mid-turn steer messages are recorded as info notices carrying this prefix —
 // both live (the "steer" event below) and in replayed history (desktop/app.go
 // prefixes persisted steers the same way). The prefix is the only durable
 // marker, so display code identifies steers by it.
 export const STEER_NOTICE_PREFIX = "↪ ";
-
 export function isSteerNoticeText(text: string): boolean {
   return text.startsWith(STEER_NOTICE_PREFIX);
 }
-
 interface State {
   items: Item[];
   running: boolean;
@@ -356,8 +326,6 @@ interface State {
   backgroundJobs: number;
   cancelRequested: boolean;
   cancellable: boolean;
-  /** Host turn phase from turn_phase events (working|checking|verifying|reviewing). */
-  turnPhase?: TurnPhaseName;
   approval?: WireApproval;
   ask?: WireAsk;
   usage?: WireUsage;
@@ -480,7 +448,6 @@ interface State {
   // Host-local only; never hydrated from history.
   streamAttemptJournal?: StreamAttemptJournal;
 }
-
 export const initialState: State = {
   items: [],
   running: false,
@@ -530,14 +497,12 @@ export const initialState: State = {
   extensionNotifications: [],
   extensionGenerations: {},
 };
-
 function usageTotalTokens(usage?: WireUsage): number {
   if (!usage) return 0;
   if (usage.totalTokens > 0) return usage.totalTokens;
   const promptTokens = usage.promptTokens || usage.cacheHitTokens + usage.cacheMissTokens;
   return Math.max(0, promptTokens + usage.completionTokens);
 }
-
 type RuntimeMetaSnapshot = {
   running: boolean;
   pendingPrompt?: boolean;
@@ -545,13 +510,11 @@ type RuntimeMetaSnapshot = {
   cancelRequested?: boolean;
   cancellable?: boolean;
 };
-
 export function foregroundRunningFromRuntimeMeta(meta: RuntimeMetaSnapshot): boolean {
   if (typeof meta.cancellable === "boolean") return meta.cancellable;
   if ((meta.backgroundJobs ?? 0) > 0 && !meta.pendingPrompt) return false;
   return Boolean(meta.running);
 }
-
 // Clock used to order live prompt events against runtime snapshot fetches.
 // Monotonic (immune to wall-clock jumps) with sub-millisecond resolution, so
 // an event and a snapshot initiated in the same millisecond still order
@@ -559,7 +522,6 @@ export function foregroundRunningFromRuntimeMeta(meta: RuntimeMetaSnapshot): boo
 export function promptEventClock(): number {
   return typeof performance !== "undefined" ? performance.now() : Date.now();
 }
-
 // True when a runtime snapshot was fetched before the tab's live approval/ask
 // event arrived. Such a snapshot reports the tab idle only because it predates
 // the prompt (pre-attach ListTabs, activation-time metas); applying it would
@@ -575,7 +537,6 @@ export function runtimeSnapshotPredatesPrompt(
   if (snapshotAt === undefined || state.promptArrivedAt === undefined) return false;
   return snapshotAt <= state.promptArrivedAt;
 }
-
 function runtimeSnapshotPredatesRetry(
   state: Pick<State, "retry"> | undefined,
   snapshotAt: number | undefined,
@@ -583,12 +544,10 @@ function runtimeSnapshotPredatesRetry(
   if (snapshotAt === undefined || state?.retry?.observedAt === undefined) return false;
   return snapshotAt <= state.retry.observedAt;
 }
-
 function updatesContextGauge(usage?: WireUsage): boolean {
   const source = usage?.source?.trim();
   return !source || source === "executor";
 }
-
 export function metaFromTab(tab: TabMeta, existing?: Meta): Meta {
   const cwd = tab.cwd || tab.workspaceRoot || existing?.cwd || "";
   const toolApprovalMode = normalizeToolApprovalMode(
@@ -611,23 +570,21 @@ export function metaFromTab(tab: TabMeta, existing?: Meta): Meta {
     sessionPath: tab.sessionPath !== undefined ? tab.sessionPath : existing?.sessionPath,
     sessionRevision: tab.sessionRevision !== undefined ? tab.sessionRevision : existing?.sessionRevision,
     sessionDigest: tab.sessionDigest !== undefined ? tab.sessionDigest : existing?.sessionDigest,
+    sessionGeneration: tab.sessionGeneration !== undefined ? tab.sessionGeneration : existing?.sessionGeneration,
     gitBranch: tab.gitBranch || existing?.gitBranch,
     autoApproveTools,
     bypass: autoApproveTools,
     collaborationMode: tab.collaborationMode ?? existing?.collaborationMode ?? "normal",
     toolApprovalMode,
-
     tokenMode: tab.tokenMode ?? existing?.tokenMode ?? "full",
     goal: tab.goal ?? existing?.goal,
     goalStatus: tab.goalStatus ?? existing?.goalStatus,
     canonicalTodos: existing?.canonicalTodos,
   };
 }
-
 function countsTowardCurrentTurn(state: State): boolean {
   return state.turnActive || state.running;
 }
-
 export function sameMeta(a?: Meta, b?: Meta): boolean {
   if (a === b) return true;
   if (!a || !b) return false;
@@ -1468,35 +1425,11 @@ function applyEvent(s: State, e: WireEvent): State {
         live: { id, text: "", reasoning: "", reasoningComplete: false },
         running: true,
         turnActive: true,
-        turnPhase: "working",
         pendingPrompt: false,
         cancelRequested: false,
         cancellable: true,
         ...resetTurnTiming(),
       };
-    }
-    case "turn_phase": {
-      const phase = (e.phase ?? e.text ?? "").trim();
-      if (!phase) return s;
-      return { ...s, turnPhase: phase, running: true, turnActive: true, cancellable: true };
-    }
-    case "completion_summary": {
-      const c = e.completion;
-      if (!c) return s;
-      const item: Item = {
-        kind: "completion_summary",
-        id: `cs${s.seq}`,
-        preset: c.preset ?? "",
-        verdict: c.verdict ?? "",
-        mutations: c.mutations ?? 0,
-        checksPassed: c.checks_passed ?? 0,
-        checksFailed: c.checks_failed ?? 0,
-        checksSuppressed: c.checks_suppressed ?? 0,
-        review: c.review ?? "none",
-        gapKinds: c.gap_kinds,
-        constraintDegraded: !!c.constraint_degraded,
-      };
-      return { ...s, seq: s.seq + 1, items: [...s.items, item] };
     }
     case "text":
     case "reasoning": {
@@ -1868,7 +1801,6 @@ function applyEvent(s: State, e: WireEvent): State {
         streamAttemptJournal: undefined,
         running: keepPlanApproval,
         turnActive: keepPlanApproval,
-        turnPhase: keepPlanApproval ? s.turnPhase : undefined,
         pendingPrompt: keepPlanApproval,
         cancelRequested: false,
         cancellable: keepPlanApproval,
@@ -2883,6 +2815,7 @@ export function useController() {
       sessionPath?: string;
       sessionRevision?: number;
       sessionDigest?: string;
+      sessionGeneration?: number;
       cancelHydrateGeneration?: number;
       deferResetUntilHistory?: boolean;
     } = {},
@@ -2891,6 +2824,7 @@ export function useController() {
     const sessionPath = (options.sessionPath ?? stateMeta?.sessionPath ?? "").trim();
     const sessionRevision = options.sessionRevision ?? stateMeta?.sessionRevision;
     const sessionDigest = options.sessionDigest ?? stateMeta?.sessionDigest;
+    const sessionGeneration = options.sessionGeneration ?? stateMeta?.sessionGeneration;
     const canJoinInFlight = !reset && !options.skipHistory;
     const shouldTrackInFlight = !options.skipHistory;
     if (canJoinInFlight) {
@@ -2910,9 +2844,16 @@ export function useController() {
         (options.preserveCachedHistory && !reset && hasReusableCachedTranscript(statesRef.current.get(tabId), sessionPath, sessionRevision, sessionDigest)),
       );
       const deferResetUntilHistory = Boolean((options.deferResetUntilHistory ?? true) && reset && !skipHistory);
-      const stillCurrent = () =>
-        sessionLoadCurrent(tabId, seq) &&
-        (cancelHydrateGeneration === undefined || cancelHydrateCurrent(tabId, cancelHydrateGeneration));
+      // Request seq alone cannot stop clear→mode-switch races: a load started
+      // after clear with stale meta.sessionPath must also be rejected.
+      const stillCurrent = () => {
+        if (!sessionLoadCurrent(tabId, seq)) return false;
+        if (cancelHydrateGeneration !== undefined && !cancelHydrateCurrent(tabId, cancelHydrateGeneration)) return false;
+        const meta = statesRef.current.get(tabId)?.meta;
+        if (sessionPath && meta?.sessionPath && meta.sessionPath !== sessionPath) return false;
+        if (sessionGeneration !== undefined && meta?.sessionGeneration !== undefined && meta.sessionGeneration !== sessionGeneration) return false;
+        return true;
+      };
       if (!stillCurrent()) return;
       addBreadcrumb("tab.hydrate", `start ${reason} ${tabId}`);
       ensureTranscriptSubscription(tabId);
@@ -4053,10 +3994,11 @@ export function useController() {
     if (tabId) {
       bumpCheckpointRefreshSeq(tabId);
       bumpSessionLoadSeq(tabId);
+      sessionLoadInFlight.current.delete(tabId);
     }
+    let cleared: { sessionPath: string; sessionRevision?: number; sessionDigest?: string; sessionGeneration: number };
     try {
-      if (tabId) await app.ClearSessionForTab(tabId);
-      else await app.ClearSession();
+      cleared = tabId ? await app.ClearSessionForTab(tabId) : await app.ClearSession();
     } catch {
       if (tabId) void loadSessionDataForTab(tabId);
       return;
@@ -4064,8 +4006,20 @@ export function useController() {
     if (tabId) bumpSessionLoadSeq(tabId);
     invalidateCache();
     if (tabId) {
+      // Retire every resident projection for this tab so a mode switch cannot
+      // preferResident-serve the destroyed transcript.
+      getTranscriptStore().evictTab(tabId);
+      const existing = statesRef.current.get(tabId)?.meta;
+      const nextMeta = {
+        ...(existing ?? { label: "", ready: true, eventChannel: "agent:event", cwd: "" }),
+        sessionPath: cleared.sessionPath || "",
+        sessionRevision: cleared.sessionRevision,
+        sessionDigest: cleared.sessionDigest,
+        sessionGeneration: cleared.sessionGeneration,
+      };
+      // Meta first so reset preserves the replacement identity.
+      dispatchTo(tabId, { type: "optimistic_meta", meta: nextMeta });
       dispatchTo(tabId, { type: "reset" });
-      // Clear placeholder items since no history action follows.
       dispatchTo(tabId, { type: "history", messages: [] });
     }
   }, [activeTabId, bumpCheckpointRefreshSeq, bumpSessionLoadSeq, dispatchTo, loadSessionDataForTab, waitForTabReady]);
