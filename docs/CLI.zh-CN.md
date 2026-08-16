@@ -406,15 +406,17 @@ reasonix sessions reindex --dir /path/to/sessions --dir /another/path
 不传 `--dir` 时，reindex 会覆盖全局会话和桌面保存的全部项目。迁移、失败降级和数据安全
 契约见 [Session Catalog and Desktop Startup](./SESSION_CATALOG.md)。
 
-可以独立检查或重建可丢弃的 Task 投影：
+历史搜索使用独立的可丢弃投影：
 
 ```sh
 reasonix doctor catalogs [--json]
-reasonix catalogs reindex tasks [--project PATH ...] [--json]
+reasonix catalogs reindex history [--dir PATH ...] [--json]
 ```
 
-权威 FileStore 边界、跨项目路由和重建行为见
-[Task Catalog](./TASK_CATALOG.zh-CN.md)。
+详见 [历史搜索 Catalog](./HISTORY_SEARCH_CATALOG.zh-CN.md)。
+用量统计使用独立的可丢弃 rollup 投影：
+reasonix catalogs reindex usage [--json]
+详见 [用量 Catalog](./USAGE_CATALOG.zh-CN.md)。
 
 ### 记忆诊断与恢复
 
@@ -435,3 +437,22 @@ reasonix catalogs reindex tasks [--project PATH ...] [--json]
 connect` 或桌面的远程网页窗口）时，它们使用远程 memory catalog，绝不回退读取桌面本机
 记忆。权限、自动召回、写入确认和迁移行为见
 [Context Engine v2](./SESSION_MEMORY_RETRIEVAL.zh-CN.md)。
+
+契约见 [Session Catalog and Desktop Startup](./SESSION_CATALOG.md)。
+
+用量统计使用独立的可丢弃 rollup 投影：
+
+```sh
+reasonix doctor catalogs [--json]
+reasonix catalogs reindex usage [--json]
+```
+
+```
+
+详见 [用量 Catalog](./USAGE_CATALOG.zh-CN.md)。
+
+### 记忆诊断与恢复
+
+直接运行 `/memory` 会显示全部 project/global active facts，不会隐藏跨 scope 的同名条目。
+每条事实包含稳定 ID、revision、scope、type、freshness 和 description。斜杠补全会提供
+

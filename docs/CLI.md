@@ -468,15 +468,17 @@ Without `--dir`, reindex includes global sessions and all projects saved by the
 desktop app. See [Session Catalog and Desktop Startup](./SESSION_CATALOG.md) for
 failure, migration, and data-safety guarantees.
 
-Inspect or rebuild the disposable task projection independently:
+History search uses a separate disposable projection:
 
 ```sh
 reasonix doctor catalogs [--json]
-reasonix catalogs reindex tasks [--project PATH ...] [--json]
+reasonix catalogs reindex history [--dir PATH ...] [--json]
 ```
 
-See [Task Catalog](./TASK_CATALOG.md) for the authoritative FileStore boundary,
-cross-project routing, and rebuild behavior.
+See [History Search Catalog](./HISTORY_SEARCH_CATALOG.md).
+Usage statistics use a separate disposable rollup projection:
+reasonix catalogs reindex usage [--json]
+See [Usage Catalog](./USAGE_CATALOG.md).
 
 ### Memory diagnostics and recovery
 
