@@ -37,7 +37,10 @@ type Event struct {
 	RetryMax        int                 `json:"retryMax,omitempty"`
 	RetryScope      string              `json:"retryScope,omitempty"` // "headers" | "stream"; omit for older clients
 	StreamAttempt   *StreamAttempt      `json:"streamAttempt,omitempty"`
-	Workspace       *WorkspaceChanged   `json:"workspace,omitempty"`
+	// ItemID correlates Steer / TurnDone / unapplied-steer with a durable
+	// session-inbox entry. Empty for legacy text-only guidance.
+	ItemID    string            `json:"itemId,omitempty"`
+	Workspace *WorkspaceChanged `json:"workspace,omitempty"`
 }
 
 type WorkspaceChanged struct {
