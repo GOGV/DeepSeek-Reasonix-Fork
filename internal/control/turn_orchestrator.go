@@ -5,11 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"reasonix/internal/agent"
-	"reasonix/internal/autoresearch"
 	"reasonix/internal/event"
 	"reasonix/internal/evidence"
 	"reasonix/internal/jobs"
@@ -27,7 +25,6 @@ type turnOrchestrator struct {
 type orchestratedTurn struct {
 	input            string
 	raw              string
-	imageRefs        string
 	display          string
 	editedOriginal   string
 	synthetic        bool
@@ -42,12 +39,8 @@ func (o *turnOrchestrator) runTurnWithRawDisplay(ctx context.Context, input, raw
 	return o.runOrchestratedTurn(ctx, orchestratedTurn{input: input, raw: raw, display: display})
 }
 
-func (o *turnOrchestrator) runTurnWithImageRefsRawDisplay(ctx context.Context, input, raw, imageRefs, display string) error {
-	return o.runOrchestratedTurn(ctx, orchestratedTurn{input: input, raw: raw, imageRefs: imageRefs, display: display})
-}
-
-func (o *turnOrchestrator) runEditedTurnWithImageRefsRawDisplay(ctx context.Context, input, raw, imageRefs, display, original string) error {
-	return o.runOrchestratedTurn(ctx, orchestratedTurn{input: input, raw: raw, imageRefs: imageRefs, display: display, editedOriginal: original})
+func (o *turnOrchestrator) runEditedTurnWithRawDisplay(ctx context.Context, input, raw, display, original string) error {
+	return o.runOrchestratedTurn(ctx, orchestratedTurn{input: input, raw: raw, display: display, editedOriginal: original})
 }
 
 func (o *turnOrchestrator) runSyntheticTurnWithRawDisplay(ctx context.Context, input, raw, display string) error {
@@ -115,11 +108,10 @@ func (o *turnOrchestrator) runSubagentSkillTurns(ctx context.Context, skills []s
 	c := o.c
 	c.maybeSessionStart(ctx)
 	parentSession := c.parentSessionID()
-	images, imageCandidates := c.resolveTurnImages(raw)
+	images := c.inputImages(raw)
 	ctx = agent.WithParentSession(ctx, parentSession)
 	ctx = jobs.WithSession(ctx, parentSession)
 	ctx = agent.WithUserImages(ctx, images)
-	ctx = agent.WithSubagentImageCandidates(ctx, imageCandidates)
 	ctx = agent.WithResponseLanguagePreference(ctx, c.responseLanguage)
 	ctx = agent.WithReasoningLanguagePreference(ctx, c.reasoningLanguage)
 
@@ -201,9 +193,8 @@ func (o *turnOrchestrator) runOrchestratedTurn(ctx context.Context, turn orchest
 	parentSession := c.parentSessionID()
 	ctx = agent.WithParentSession(ctx, parentSession)
 	ctx = jobs.WithSession(ctx, parentSession)
-	userImages, imageCandidates := c.resolveTurnImages(turn.imageReferenceInput())
+	userImages := c.inputImages(turn.input)
 	ctx = agent.WithUserImages(ctx, userImages)
-	ctx = agent.WithSubagentImageCandidates(ctx, imageCandidates)
 	ctx = agent.WithRawUserInput(ctx, turn.raw)
 	continuation := turn.goalContinuation
 	var input string
@@ -214,8 +205,6 @@ func (o *turnOrchestrator) runOrchestratedTurn(ctx context.Context, turn orchest
 			false,
 			continuation.goal,
 			GoalStatusRunning,
-			continuation.researchMode,
-			continuation.autoResearchTaskID,
 		)
 	} else {
 		input = c.compose(turn.input, turn.raw, !turn.synthetic)
@@ -266,14 +255,6 @@ func (o *turnOrchestrator) runOrchestratedTurn(ctx context.Context, turn orchest
 		defer func() { c.hooks.StopResult(context.Background(), lastAssistantText(c.History()), turn, err) }()
 	}
 	c.markInFlightTurn(startMessages, !turn.synthetic && !IsSyntheticUserMessage(turn.raw))
-	var autoResearchTaskID string
-	if continuation != nil {
-		autoResearchTaskID = continuation.autoResearchTaskID
-	} else {
-		autoResearchTaskID = c.goals.currentAutoResearchTaskID()
-	}
-	autoResearchAcceptedBefore := c.autoResearch.acceptedEvidenceIDs(autoResearchTaskID)
-	c.autoResearch.heartbeat(autoResearchTaskID, autoresearch.HeartbeatStartingTurn, "")
 	if continuation != nil {
 		ctx = agent.WithDeliveryExecutionScope(ctx, agent.DeliveryExecutionScope{
 			ID:       continuation.scopeID,
@@ -309,13 +290,8 @@ func (o *turnOrchestrator) runOrchestratedTurn(ctx context.Context, turn orchest
 	err = c.runner.Run(ctx, modelInput)
 	c.persistGoalDeliveryCheckpoint()
 	if err == nil {
-		assistantText := lastAssistantText(c.History())
-		c.autoResearch.recordEvidenceFromAssistant(autoResearchTaskID, assistantText)
-		c.autoResearch.recordTurnProgress(autoResearchTaskID, autoResearchAcceptedBefore, assistantText)
-		c.autoResearch.heartbeat(autoResearchTaskID, autoresearch.HeartbeatTurnDone, "")
 		c.clearInFlightTurn()
 	} else {
-		c.autoResearch.heartbeat(autoResearchTaskID, autoresearch.HeartbeatWarning, err.Error())
 		// When the user explicitly cancels, keep the real prompt and any fully
 		// paired tool work. Partial reasoning/output remains durable for display
 		// but is marked local-only, and a bounded recovery summary is folded into
@@ -397,12 +373,8 @@ func (o *turnOrchestrator) runOrchestratedTurn(ctx context.Context, turn orchest
 }
 
 func (o *turnOrchestrator) runGoalLoopWithRawDisplay(ctx context.Context, input, raw, display string) error {
-	return o.runGoalLoopWithImageRefsRawDisplay(ctx, input, raw, "", display)
-}
-
-func (o *turnOrchestrator) runGoalLoopWithImageRefsRawDisplay(ctx context.Context, input, raw, imageRefs, display string) error {
 	expectedContinuationEpoch := o.c.goals.continuationToken()
-	err := o.runTurnWithImageRefsRawDisplay(ctx, input, raw, imageRefs, display)
+	err := o.runTurnWithRawDisplay(ctx, input, raw, display)
 	if err != nil {
 		if ctx.Err() != nil {
 			o.c.goalUsageTee.setActiveRecorder(nil)
@@ -425,12 +397,8 @@ func (o *turnOrchestrator) runGoalLoopWithImageRefsRawDisplay(ctx context.Contex
 }
 
 func (o *turnOrchestrator) runEditedGoalLoopWithRawDisplay(ctx context.Context, input, raw, display, original string) error {
-	return o.runEditedGoalLoopWithImageRefsRawDisplay(ctx, input, raw, "", display, original)
-}
-
-func (o *turnOrchestrator) runEditedGoalLoopWithImageRefsRawDisplay(ctx context.Context, input, raw, imageRefs, display, original string) error {
 	expectedContinuationEpoch := o.c.goals.continuationToken()
-	err := o.runEditedTurnWithImageRefsRawDisplay(ctx, input, raw, imageRefs, display, original)
+	err := o.runEditedTurnWithRawDisplay(ctx, input, raw, display, original)
 	if err != nil {
 		if ctx.Err() != nil {
 			o.c.goalUsageTee.setActiveRecorder(nil)
@@ -530,17 +498,6 @@ func (o *turnOrchestrator) advanceGoalAfterTurn(ctx context.Context, expectedCon
 	} else if c.executor != nil {
 		readiness = c.executor.ReadinessResult()
 	}
-	if arReadiness := c.autoResearchReadinessFailure(); arReadiness != "" {
-		readiness.Ready = false
-		readiness.Missing = append(readiness.Missing, "autoresearch")
-		if readiness.Reason != "" {
-			readiness.Reason += "\n" + arReadiness
-		} else {
-			readiness.Reason = arReadiness
-		}
-	}
-	autoResearchTaskID := c.goals.currentAutoResearchTaskID()
-
 	// The validated update_goal report for this turn, if any.
 	var report *goalTurnReport
 	if recorder != nil {
@@ -582,39 +539,12 @@ func (o *turnOrchestrator) advanceGoalAfterTurn(ctx context.Context, expectedCon
 	})
 	c.persistGoalState(res.path, res.data, res.ok)
 	if res.notice != "" {
-		c.finalizeAutoResearchTask(autoResearchTaskID, res.notice)
 		c.notice(res.notice)
 	}
 	if res.notice == goalCompleteNotice && c.executor != nil {
 		c.completeRemainingGoalTodos()
 	}
 	return res
-}
-
-func (c *Controller) finalizeAutoResearchTask(taskID, notice string) {
-	if !c.autoResearch.enabled() || strings.TrimSpace(taskID) == "" {
-		return
-	}
-	switch {
-	case notice == goalCompleteNotice:
-		status := autoresearch.StatusComplete
-		if err := c.autoResearch.updateProgress(taskID, autoresearch.ProgressPatch{Status: &status}); err != nil {
-			c.noticeDetail("AutoResearch status update failed.", "autoresearch task completion update failed: "+err.Error())
-			return
-		}
-		c.notice("autoresearch task completed: " + taskID)
-	case strings.HasPrefix(notice, "goal blocked: ") || notice == "goal continuation limit reached":
-		status := autoresearch.StatusBlocked
-		reason := strings.TrimPrefix(notice, "goal blocked: ")
-		if reason == "" {
-			reason = notice
-		}
-		if err := c.autoResearch.updateProgress(taskID, autoresearch.ProgressPatch{Status: &status, BlockedReason: &reason}); err != nil {
-			c.noticeDetail("AutoResearch status update failed.", "autoresearch task blocked update failed: "+err.Error())
-			return
-		}
-		c.noticeDetail("AutoResearch task marked blocked.", "autoresearch task blocked: "+taskID+"\nreason: "+reason)
-	}
 }
 
 // completeRemainingGoalTodos force-completes any remaining incomplete canonical
