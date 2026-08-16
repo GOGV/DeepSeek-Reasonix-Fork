@@ -51,7 +51,17 @@ func TestGoalTokenBudgetPausesAndResumes(t *testing.T) {
 	if !c.ResumeGoal() || c.GoalStatus() != GoalStatusRunning {
 		t.Fatalf("spend pause did not resume: status = %q", c.GoalStatus())
 	}
-	if rt := c.GoalRuntime(); rt.TokensUsed != 0 || rt.TokensLimit != 150 {
-		t.Fatalf("resumed runtime = %+v, want a fresh budget", rt)
+	resumed := c.GoalRuntime()
+	if resumed.TokensUsed != rt.TokensUsed || resumed.RequestsUsed != rt.RequestsUsed || resumed.TurnsUsed != rt.TurnsUsed || resumed.TokensLimit != rt.TokensUsed+150 {
+		t.Fatalf("resumed runtime = %+v, want cumulative statistics plus one fresh budget slice after %+v", resumed, rt)
+	}
+
+	// The Agent's spend accumulator is reset with the slice: continuing can do
+	// another full slice of work instead of immediately re-pausing on old spend.
+	c.Submit("continue")
+	waitGoalTurnDone(t, events)
+	again := c.GoalRuntime()
+	if c.GoalStatus() != GoalStatusBlocked || again.StopCause != stopCauseBudgetSpend || again.TokensUsed <= resumed.TokensUsed {
+		t.Fatalf("second spend slice = status:%q runtime:%+v", c.GoalStatus(), again)
 	}
 }

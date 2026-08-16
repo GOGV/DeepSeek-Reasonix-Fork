@@ -2874,12 +2874,16 @@ func (c *Controller) ResumeGoal() bool {
 	if handled, resumed := c.retryBlockedLegacyGoal(); handled {
 		return resumed
 	}
+	spentBudget := c.goals.runtimeView().StopCause == stopCauseBudgetSpend
 	path, data, persist, resumed := c.goals.resume(c.goalTodos())
 	if !resumed {
 		return false
 	}
 	c.persistGoalState(path, data, persist)
 	if c.executor != nil {
+		if spentBudget {
+			c.executor.ResetTaskBudget()
+		}
 		c.executor.RestoreDeliveryCheckpoint(c.goals.deliveryState())
 	}
 	return true
