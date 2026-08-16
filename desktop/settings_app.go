@@ -1955,6 +1955,7 @@ func (a *App) buildSettingReplacementController(tab *WorkspaceTab, snap tabRunti
 		WorkspaceRoot:            snap.workspaceRoot,
 		SessionDir:               sessionDirForSnapshot(snap),
 		EffortOverride:           cloneStringPtr(snap.effort),
+		AgentPreset:              boot.NormalizeAgentPreset(runtime.tokenMode),
 		TokenMode:                runtime.tokenMode,
 		SharedHost:               a.lookupSharedHost(snap.sharedHostKey),
 		CleanupPendingReconciler: reconcileDesktopCleanupPending,
