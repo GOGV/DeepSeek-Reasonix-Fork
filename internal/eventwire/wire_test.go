@@ -46,22 +46,17 @@ func TestToWireStreamAttemptJSON(t *testing.T) {
 	}
 }
 
-func TestToWireWorkspaceChangedKeepsBoundedEmptyArrays(t *testing.T) {
-	w := ToWire(event.Event{Kind: event.WorkspaceChanged, Workspace: &event.WorkspaceChangedPayload{
-		Revisions:  event.WorkspaceRevision{Content: 4, Tree: 2, WorkingTree: 3, GitMeta: 1, Session: 7},
-		WatchState: event.WorkspaceWatchDegraded,
-		Source:     "reconcile",
+func TestToWireContextMaintenanceJSON(t *testing.T) {
+	w := ToWire(event.Event{Kind: event.ContextMaintenanceEvent, Maintenance: &event.ContextMaintenance{
+		Status: "applied", Action: "prune", SavedTokens: 4096, ProjectionVersion: 3, CacheBreak: true,
 	}})
-	if w.Workspace == nil || w.Workspace.Changes == nil {
-		t.Fatalf("workspace payload/changes must be non-nil: %+v", w.Workspace)
-	}
 	b, err := json.Marshal(w)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("marshal: %v", err)
 	}
-	for _, want := range []string{`"kind":"workspace_changed"`, `"changes":[]`, `"watchState":"degraded"`, `"session":7`} {
+	for _, want := range []string{`"kind":"context_maintenance"`, `"action":"prune"`, `"savedTokens":4096`, `"projectionVersion":3`, `"cacheBreak":true`} {
 		if !strings.Contains(string(b), want) {
-			t.Fatalf("workspace JSON = %s, missing %s", b, want)
+			t.Fatalf("context maintenance JSON = %s, want %s", b, want)
 		}
 	}
 }

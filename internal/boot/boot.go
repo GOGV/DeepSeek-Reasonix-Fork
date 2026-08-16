@@ -1034,9 +1034,7 @@ func build(ctx context.Context, opts Options) (*BuildResult, error) {
 		}
 		return ""
 	}
-	bashSandboxEnforced := func() bool {
-		return bashSpec.Enforce()
-	}
+	bashSandboxEnforced := bashSpec.Enforce
 	taskToolAdded := false
 	readOnlyTaskToolAdded := false
 	var taskTool *agent.TaskTool
@@ -1055,6 +1053,7 @@ func build(ctx context.Context, opts Options) (*BuildResult, error) {
 			ToolResultSnipRatio: cfg.Agent.ToolResultSnipRatio,
 			CompactRatio:        cfg.Agent.CompactRatio,
 			CompactForceRatio:   cfg.Agent.CompactForceRatio,
+			ContextEditing:      cfg.Agent.ContextEditing,
 			Temperature:         cfg.Agent.Temperature,
 			ArchiveDir:          config.ArchiveDir(),
 			SysPrompt:           "",
@@ -1198,6 +1197,7 @@ func build(ctx context.Context, opts Options) (*BuildResult, error) {
 			ToolResultSnipRatio: cfg.Agent.ToolResultSnipRatio,
 			CompactRatio:        cfg.Agent.CompactRatio,
 			CompactForceRatio:   cfg.Agent.CompactForceRatio,
+			ContextEditing:      cfg.Agent.ContextEditing,
 			ArchiveDir:          config.ArchiveDir(),
 			KeepPolicy:          keepPolicy,
 			ResponseLanguage:    agent.ResponseLanguageFromContext(sctx),
@@ -1824,6 +1824,7 @@ func build(ctx context.Context, opts Options) (*BuildResult, error) {
 		ToolResultSnipRatio:          cfg.Agent.ToolResultSnipRatio,
 		CompactRatio:                 cfg.Agent.CompactRatio,
 		CompactForceRatio:            cfg.Agent.CompactForceRatio,
+		ContextEditing:               cfg.Agent.ContextEditing,
 		RecentKeep:                   cfg.Agent.RecentKeep,
 		ArchiveDir:                   config.ArchiveDir(),
 		KeepPolicy:                   keepPolicy,
@@ -1879,6 +1880,7 @@ func build(ctx context.Context, opts Options) (*BuildResult, error) {
 				ToolResultSnipRatio:          cfg.Agent.ToolResultSnipRatio,
 				CompactRatio:                 cfg.Agent.CompactRatio,
 				CompactForceRatio:            cfg.Agent.CompactForceRatio,
+				ContextEditing:               cfg.Agent.ContextEditing,
 				RecentKeep:                   cfg.Agent.RecentKeep,
 				ArchiveDir:                   config.ArchiveDir(),
 				KeepPolicy:                   keepPolicy,

@@ -2,6 +2,8 @@
 // One event channel carries every kind; `kind` discriminates the payload.
 
 import type { Todo } from "./tools";
+import type { ContextMaintenanceInfo, WireContextMaintenance } from "./contextMaintenanceTypes";
+export type { ContextMaintenanceInfo, ContextMaintenanceReceipt, WireContextMaintenance } from "./contextMaintenanceTypes";
 
 export type EventKind =
   | "turn_started"
@@ -26,7 +28,7 @@ export type EventKind =
   | "extension_surface"
   | "extension_status"
   | "stream_attempt"
-  | "workspace_changed";
+  | "context_maintenance";
 
 export type StreamAttemptAction = "begin" | "discard" | "commit";
 
@@ -293,6 +295,7 @@ export interface WireEvent {
   approval?: WireApproval;
   ask?: WireAsk;
   compaction?: WireCompaction;
+  maintenance?: WireContextMaintenance;
   guardian?: WireGuardian;
   decisionReceipt?: WireDecisionReceipt;
   extension?: WireExtensionSurface;
@@ -306,7 +309,6 @@ export interface WireEvent {
   /** Optional: "headers" | "stream". Older clients ignore unknown fields. */
   retryScope?: "headers" | "stream";
   streamAttempt?: WireStreamAttempt;
-  workspace?: WireWorkspaceChanged;
   tabId?: string; // Go's tabEventSink tags events for the correct per-tab reducer.
   runtimeEpoch?: string;
   sessionHitTokens?: number;
@@ -315,31 +317,6 @@ export interface WireEvent {
   sessionCurrency?: string;
   // Deprecated compatibility alias. Prefer sessionCost + sessionCurrency.
   sessionCostUsd?: number;
-}
-
-export type WorkspaceWatchState = "active" | "degraded" | "unavailable";
-export type WorkspaceChangeOp = "create" | "write" | "remove" | "rename" | "unknown";
-
-export interface WorkspaceRevisions {
-  content: number;
-  tree: number;
-  workingTree: number;
-  gitMeta: number;
-  session: number;
-}
-
-export interface WorkspacePathChange {
-  path: string;
-  oldPath?: string;
-  op: WorkspaceChangeOp;
-}
-
-export interface WireWorkspaceChanged {
-  revisions: WorkspaceRevisions;
-  changes: WorkspacePathChange[];
-  allPaths: boolean;
-  source: "agent" | "filesystem" | "git" | "mixed" | "reconcile";
-  watchState: WorkspaceWatchState;
 }
 
 export type SessionRuntimePhase = "starting" | "ready" | "lease_blocked" | "failed" | "closing";
@@ -816,6 +793,7 @@ export interface ContextInfo {
   cacheMissTokens?: number;
   estimated?: boolean;
   sources?: Record<string, UsageSourceStats>;
+  maintenance?: ContextMaintenanceInfo;
 }
 
 export interface Meta {
@@ -2112,8 +2090,6 @@ export interface SettingsView {
   desktopTerminalTheme: string; // "auto" follows app | "dark" | "light"
   closeBehavior: string; // "background" | "quit"
   displayMode: string;   // "standard" | "compact"
-  reasoningDisplayMode: string; // "hidden" | "summary" | "auto"
-  reasoningDisplayModeExplicit?: boolean;
   statusBarStyle: string; // "icon" | "text"
   statusBarItems: string[]; // ordered visible status bar item ids
   defaultToolApprovalMode: ToolApprovalMode | string; // default for newly-created sessions
@@ -2137,8 +2113,6 @@ export interface DesktopStartupSettingsView {
   desktopThemeStyle: string;
   desktopTerminalTheme: string; // "auto" follows app | "dark" | "light"
   displayMode: string;   // "standard" | "compact"
-  reasoningDisplayMode: string; // "hidden" | "summary" | "auto"
-  reasoningDisplayModeExplicit?: boolean;
   statusBarStyle: string; // "icon" | "text"
   statusBarItems: string[]; // ordered visible status bar item ids
   checkUpdates: boolean; // check for new versions on startup
@@ -2159,7 +2133,7 @@ export interface ExternalOpenerView {
 
 export interface ExternalOpenersView {
   openers: ExternalOpenerView[];
-  preferred: string;
+  preferred: string; workspaceOpenable?: boolean;
 }
 
 // Auto-updater payloads (desktop/updater.go). UpdateInfo drives the update banner;
