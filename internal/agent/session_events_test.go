@@ -135,7 +135,7 @@ func TestLoadSessionIgnoresForeignEventLog(t *testing.T) {
 	}
 }
 
-func TestForceSaveLeavesLegacyEventTranscriptUntouched(t *testing.T) {
+func TestSaveLeavesLegacyEventTranscriptUntouched(t *testing.T) {
 	// The v0.x migration reconstructs sessions from legacy Claude-style
 	// ".events.jsonl" transcripts that live in the SAME directory the native
 	// session is imported into — i.e. exactly at the native event-log path.
@@ -154,7 +154,7 @@ func TestForceSaveLeavesLegacyEventTranscriptUntouched(t *testing.T) {
 	s.Add(provider.Message{Role: provider.RoleUser, Content: "hello from v0.x"})
 	s.Add(provider.Message{Role: provider.RoleAssistant, Content: "hi"})
 	if err := s.Save(path); err != nil {
-		t.Fatalf("force Save beside legacy transcript: %v", err)
+		t.Fatalf("Save beside legacy transcript: %v", err)
 	}
 
 	got, err := os.ReadFile(logPath)

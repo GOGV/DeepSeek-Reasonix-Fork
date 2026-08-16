@@ -619,6 +619,8 @@ export interface HistorySlice {
   endTurn: number;
   stale: boolean; // cursor bound to an older session revision: discard + reload
   revision: number;
+  revisionKnown?: boolean;
+  digest?: string;
   // Diagnostic read path: index|scan|event-log|live-index|live-fallback (empty when the
   // backend predates the field or no session was readable).
   source?: string;
