@@ -4,7 +4,7 @@
     "commented-code": 0,
     "complexity": 2074,
     "essay": 4082,
-    "file-size": 109576,
+    "file-size": 109586,
     "function-size": 8927,
     "layering": 1,
     "marker": 0,
@@ -162,7 +162,7 @@
       "file-size": 415
     },
     "desktop/frontend/src/lib/bridge.ts": {
-      "file-size": 4752
+      "file-size": 4750
     },
     "desktop/frontend/src/lib/crash.ts": {
       "file-size": 225
@@ -171,7 +171,7 @@
       "file-size": 307
     },
     "desktop/frontend/src/lib/types.ts": {
-      "file-size": 1453
+      "file-size": 1451
     },
     "desktop/frontend/src/lib/useController.ts": {
       "file-size": 3929
@@ -580,7 +580,7 @@
     "internal/agent/save.go": {
       "complexity": 49,
       "essay": 112,
-      "file-size": 1522,
+      "file-size": 1536,
       "function-size": 124
     },
     "internal/agent/save_test.go": {
