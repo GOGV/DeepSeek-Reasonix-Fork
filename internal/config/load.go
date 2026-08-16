@@ -136,6 +136,7 @@ func loadForRoot(root string, migrateOnDisk bool) (*Config, error) {
 	globalRemote := cfg.Remote.Clone()
 	globalDesktopLanguage := cfg.Desktop.Language
 	globalPricingCurrency := cfg.Desktop.Currency
+	globalBillingDisplayCurrency := cfg.Billing.DisplayCurrency
 	globalTelemetry := cfg.Telemetry
 
 	tomlSources = append(tomlSources, projectTOML)
@@ -169,6 +170,7 @@ func loadForRoot(root string, migrateOnDisk bool) (*Config, error) {
 	// A repository must not be able to alter how the user's spend is shown.
 	cfg.Desktop.Language = globalDesktopLanguage
 	cfg.Desktop.Currency = globalPricingCurrency
+	cfg.Billing.DisplayCurrency = globalBillingDisplayCurrency
 	// CLI telemetry is an explicit user-global privacy choice. Project config
 	// cannot opt a user in or out, including when the global value is absent.
 	cfg.Telemetry = globalTelemetry
@@ -232,6 +234,8 @@ func loadForRoot(root string, migrateOnDisk bool) (*Config, error) {
 	normalizeLegacyProviderModels(cfg)
 	normalizeDesktopOfficialProviderAccess(cfg)
 	normalizeOfficialDeepSeekModels(cfg)
+	migrateBillingDisplayCurrency(cfg)
+	freezeProviderBillingCurrencies(cfg)
 	applyDeepSeekOfficialDefaultPricing(cfg)
 	backfillDeepSeekOfficialPrices(cfg)
 	normalizeEffortConfig(cfg)
@@ -388,11 +392,16 @@ func backfillDeepSeekPro(c *Config) {
 	for _, bp := range Default().Providers {
 		if bp.Name == "deepseek-pro" {
 			bp.APIKeyEnv = flash.APIKeyEnv
-			currency := c.DeepSeekOfficialPricingCurrency()
-			if c.DesktopCurrency() == "" && flash.persistedOfficialCurrency != "" {
+			// Inherit the flash provider's frozen billing currency for list prices.
+			currency := flash.ProviderBillingCurrency()
+			if currency == "" {
 				currency = flash.persistedOfficialCurrency
-				bp.persistedOfficialCurrency = currency
 			}
+			if currency == "" {
+				currency = "USD"
+			}
+			bp.BillingCurrency = currency
+			bp.persistedOfficialCurrency = currency
 			bp.Price = deepSeekV4PriceForModel(currency, proModel)
 			c.Providers = append(c.Providers, bp)
 			return
@@ -410,9 +419,12 @@ func backfillDeepSeekOfficialPrices(c *Config) {
 			continue
 		}
 		backfillDeepSeekOfficialEndpointDefaults(p)
-		currency := c.DeepSeekOfficialPricingCurrency()
-		if c.DesktopCurrency() == "" && p.persistedOfficialCurrency != "" {
+		currency := p.ProviderBillingCurrency()
+		if currency == "" {
 			currency = p.persistedOfficialCurrency
+		}
+		if currency == "" {
+			currency = "USD"
 		}
 		defaults := DeepSeekV4PricesForCurrency(currency)
 		if p.Price != nil {
@@ -805,6 +817,8 @@ func normalizeConfigForEdit(cfg *Config) bool {
 	normalizeLegacyProviderModels(cfg)
 	normalizeDesktopOfficialProviderAccess(cfg)
 	normalizeOfficialDeepSeekModels(cfg)
+	migrateBillingDisplayCurrency(cfg)
+	freezeProviderBillingCurrencies(cfg)
 	applyDeepSeekOfficialDefaultPricing(cfg)
 	backfillDeepSeekOfficialPrices(cfg)
 	normalizeEffortConfig(cfg)
