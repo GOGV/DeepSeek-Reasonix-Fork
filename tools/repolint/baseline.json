@@ -2,10 +2,10 @@
   "limits": {
     "banner": 15,
     "commented-code": 0,
-    "complexity": 2085,
+    "complexity": 2080,
     "essay": 4099,
-    "file-size": 110865,
-    "function-size": 9157,
+    "file-size": 110691,
+    "function-size": 9129,
     "layering": 1,
     "marker": 0,
     "narrative": 64,
@@ -28,7 +28,7 @@
     "desktop/app.go": {
       "complexity": 63,
       "essay": 96,
-      "file-size": 11489,
+      "file-size": 11484,
       "function-size": 381
     },
     "desktop/app_autosave_test.go": {
@@ -156,13 +156,13 @@
       "file-size": 276
     },
     "desktop/frontend/src/components/WorkspacePanel.tsx": {
-      "file-size": 1411
+      "file-size": 1356
     },
     "desktop/frontend/src/custom/features/heartbeat/HeartbeatPanel.tsx": {
       "file-size": 415
     },
     "desktop/frontend/src/lib/bridge.ts": {
-      "file-size": 4676
+      "file-size": 4671
     },
     "desktop/frontend/src/lib/crash.ts": {
       "file-size": 225
@@ -171,7 +171,7 @@
       "file-size": 307
     },
     "desktop/frontend/src/lib/types.ts": {
-      "file-size": 1455
+      "file-size": 1428
     },
     "desktop/frontend/src/lib/useController.ts": {
       "file-size": 3925
@@ -309,7 +309,7 @@
     "desktop/tabs.go": {
       "complexity": 74,
       "essay": 133,
-      "file-size": 8719,
+      "file-size": 8705,
       "function-size": 630
     },
     "desktop/tabs_order_test.go": {
@@ -438,7 +438,7 @@
     "internal/agent/agent.go": {
       "complexity": 61,
       "essay": 108,
-      "file-size": 2762,
+      "file-size": 2760,
       "function-size": 125
     },
     "internal/agent/ask.go": {
@@ -492,14 +492,14 @@
       "test-file-size": 501
     },
     "internal/agent/execute_batch.go": {
-      "complexity": 48,
-      "function-size": 213
+      "complexity": 43,
+      "function-size": 199
     },
     "internal/agent/execute_one.go": {
       "complexity": 13,
       "essay": 23,
-      "file-size": 158,
-      "function-size": 20
+      "file-size": 154,
+      "function-size": 19
     },
     "internal/agent/extensions.go": {
       "essay": 64
@@ -1197,7 +1197,7 @@
     },
     "internal/event/event.go": {
       "essay": 10,
-      "file-size": 43,
+      "file-size": 6,
       "narrative": 1
     },
     "internal/event/subagent_progress.go": {
@@ -1207,12 +1207,12 @@
       "essay": 2
     },
     "internal/eventwire/wire.go": {
-      "function-size": 24
+      "function-size": 11
     },
     "internal/evidence/evidence.go": {
       "complexity": 6,
       "essay": 38,
-      "file-size": 2083
+      "file-size": 2058
     },
     "internal/evidence/evidence_test.go": {
       "essay": 1,
