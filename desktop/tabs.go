@@ -2175,6 +2175,7 @@ type TabMeta struct {
 	CollaborationMode string             `json:"collaborationMode"`
 	ToolApprovalMode  string             `json:"toolApprovalMode"`
 	TokenMode         string             `json:"tokenMode"`
+	AgentPreset       string             `json:"agentPreset,omitempty"`
 	Goal              string             `json:"goal,omitempty"`
 	GoalStatus        string             `json:"goalStatus,omitempty"`
 	Recovered         bool               `json:"recovered,omitempty"`
@@ -2230,7 +2231,8 @@ func (a *App) tabMeta(tab *WorkspaceTab, active bool) TabMeta {
 		Mode:              currentTabMode(tab),
 		CollaborationMode: currentTabCollaborationMode(tab),
 		ToolApprovalMode:  currentTabToolApprovalMode(tab),
-		TokenMode:         currentTabTokenMode(tab),
+		AgentPreset:       boot.AgentPresetBalanced, // deprecated compat label
+		TokenMode:         boot.TokenModeFull,       // deprecated compat label
 		Goal:              currentTabGoal(tab),
 		GoalStatus:        currentTabGoalStatus(tab),
 		StartupErr:        tab.StartupErr,
@@ -2543,14 +2545,14 @@ func (a *App) ActivateTopic(scope, workspaceRoot, topicID, sessionPath string) (
 // creating or reusing a blank session, it removes other visible tabs while
 // preserving running runtimes as detached background sessions.
 func (a *App) EnsureBlankSurface(scope, workspaceRoot string) (TabMeta, error) {
-	return a.ensureBlankSurface(scope, workspaceRoot, "")
+	return a.ensureBlankSurface(scope, workspaceRoot)
 }
 
-func (a *App) ensureBlankSurface(scope, workspaceRoot, tokenMode string) (TabMeta, error) {
+func (a *App) ensureBlankSurface(scope, workspaceRoot string) (TabMeta, error) {
 	a.singleSurfaceMu.Lock()
 	defer a.singleSurfaceMu.Unlock()
 
-	meta, err := a.ensureBlankTab(scope, workspaceRoot, tokenMode)
+	meta, err := a.ensureBlankTab(scope, workspaceRoot)
 	if err != nil {
 		return TabMeta{}, err
 	}
@@ -2582,10 +2584,10 @@ func tabInWorkspace(tab *WorkspaceTab, workspaceRoot string) bool {
 // creates one if none exists. Reusing a blank tab keeps repeated "new session"
 // clicks from piling up empty conversations.
 func (a *App) EnsureBlankTab(scope, workspaceRoot string) (TabMeta, error) {
-	return a.ensureBlankTab(scope, workspaceRoot, "")
+	return a.ensureBlankTab(scope, workspaceRoot)
 }
 
-func (a *App) ensureBlankTab(scope, workspaceRoot, forcedTokenMode string) (TabMeta, error) {
+func (a *App) ensureBlankTab(scope, workspaceRoot string) (TabMeta, error) {
 	scope = strings.TrimSpace(scope)
 	if scope != "project" {
 		scope = "global"
@@ -2655,19 +2657,15 @@ func (a *App) ensureBlankTab(scope, workspaceRoot, forcedTokenMode string) (TabM
 	// continuity without letting the active tab override global defaults (#4019).
 	inheritedModel := defaultModel
 	var inheritedEffort *string
-	inheritedTokenMode := boot.TokenModeFull
+	inheritedTokenMode := boot.TokenModeFull // deprecated dual-write compat value
 	inheritedMode := tabModeFromAxes(false, defaultToolApprovalMode == control.ToolApprovalYolo)
 	inheritedToolApprovalMode := defaultToolApprovalMode
 	inheritedDisabledMCP := map[string]ServerView{}
 	var inheritedMCPOrder []string
 	if active := a.activeTabLocked(); active != nil {
 		inheritedEffort = cloneStringPtr(active.effort)
-		inheritedTokenMode = currentTabTokenMode(active)
 		inheritedDisabledMCP = cloneServerViewMap(active.disabledMCP)
 		inheritedMCPOrder = append([]string(nil), active.mcpOrder...)
-	}
-	if strings.TrimSpace(forcedTokenMode) != "" {
-		inheritedTokenMode = boot.NormalizeTokenMode(forcedTokenMode)
 	}
 
 	if topicID := a.indexedBlankTopicIDLocked(scope, workspaceRoot); topicID != "" {
@@ -3890,7 +3888,6 @@ func (a *App) buildTabControllerWithContextCore(tab *WorkspaceTab, loadedSession
 		WorkspaceRoot:            root,
 		SessionDir:               sessionDir,
 		EffortOverride:           cloneStringPtr(buildEffort),
-		TokenMode:                buildTokenMode,
 		SharedHost:               sharedHost,
 		CleanupPendingReconciler: reconcileDesktopCleanupPending,
 		SubagentParentLive:       a.subagentParentProbeForBuild(tab),
@@ -4894,6 +4891,7 @@ type desktopTabEntry struct {
 	Model            string  `json:"model,omitempty"`
 	Effort           *string `json:"effort,omitempty"`
 	TokenMode        string  `json:"tokenMode,omitempty"`
+	AgentPreset      string  `json:"agentPreset,omitempty"`
 	Mode             string  `json:"mode,omitempty"`
 	Goal             string  `json:"goal,omitempty"`
 	ToolApprovalMode string  `json:"toolApprovalMode,omitempty"`
@@ -4957,6 +4955,7 @@ func (a *App) saveTabsCollectLocked() (string, []desktopTabEntry, string, uint64
 				Model:            tab.model,
 				Effort:           cloneStringPtr(tab.effort),
 				TokenMode:        persistedTabTokenMode(currentTabTokenMode(tab)),
+				AgentPreset:      boot.AgentPresetBalanced,
 				Mode:             persistedTabMode(currentTabMode(tab)),
 				Goal:             persistedTabGoal(tab),
 				ToolApprovalMode: persistedToolApprovalMode(currentTabToolApprovalMode(tab)),
@@ -6133,7 +6132,7 @@ func (a *App) tabSessionRecoveryMeta(tab *WorkspaceTab) func(control.SessionReco
 		topicID := tab.TopicID
 		topicTitle := tab.TopicTitle
 		model := strings.TrimSpace(tab.model)
-		tokenMode := persistedTabTokenMode(boot.NormalizeTokenMode(tab.tokenMode))
+		tokenMode := boot.TokenModeFull // deprecated dual-write compat value
 		mode := normalizeTabMode(tab.mode)
 		toolApprovalMode := normalizeToolApprovalMode(tab.toolApprovalMode)
 		goal := strings.TrimSpace(tab.goal)
@@ -6160,6 +6159,7 @@ func (a *App) tabSessionRecoveryMeta(tab *WorkspaceTab) func(control.SessionReco
 			TopicID:          topicID,
 			TopicTitle:       topicTitle,
 			Model:            model,
+			AgentPreset:      boot.AgentPresetBalanced, // deprecated compat label
 			TokenMode:        tokenMode,
 			Mode:             persistedTabMode(mode),
 			ToolApprovalMode: persistedToolApprovalMode(toolApprovalMode),
@@ -7437,11 +7437,12 @@ func currentTabToolApprovalMode(tab *WorkspaceTab) string {
 	return normalizeToolApprovalMode(tab.toolApprovalMode)
 }
 
+// currentTabTokenMode returns the deprecated dual-write compat label. Execution
+// modes no longer exist at runtime; the value is pinned so one-version-old
+// clients keep parsing tab state.
 func currentTabTokenMode(tab *WorkspaceTab) string {
-	if tab == nil {
-		return boot.TokenModeFull
-	}
-	return boot.NormalizeTokenMode(tab.tokenMode)
+	_ = tab
+	return boot.TokenModeFull
 }
 
 // tabRuntimeSnapshot is a consistent under-a.mu copy of the per-tab fields
@@ -7562,10 +7563,6 @@ func (s tabRuntimeSnapshot) currentToolApprovalMode() string {
 	return normalizeToolApprovalMode(s.toolApprovalMode)
 }
 
-func (s tabRuntimeSnapshot) currentTokenMode() string {
-	return boot.NormalizeTokenMode(s.tokenMode)
-}
-
 // normalizedRuntime reads live Controller state only after the App snapshot has
 // released a.mu. Rebuild callers hold turnStartMu while invoking it, so all
 // three axes and the legacy Goal fallback describe one admitted runtime state.
@@ -7617,12 +7614,11 @@ func applyNormalizedRuntimeToTabLocked(tab *WorkspaceTab, runtime normalizedTabR
 	}
 }
 
+// persistedTabTokenMode pins the deprecated tokenMode compat value written
+// into tab state and session metas. It is always the safe default.
 func persistedTabTokenMode(mode string) string {
-	mode = boot.NormalizeTokenMode(mode)
-	if mode == boot.TokenModeEconomy || mode == boot.TokenModeDelivery {
-		return mode
-	}
-	return ""
+	_ = mode
+	return boot.TokenModeFull
 }
 
 func normalizeToolApprovalMode(mode string) string {
@@ -7974,6 +7970,7 @@ func saveTabSessionMetaSnapshot(snap tabSessionMetaSnapshot) error {
 	m.TopicID = snap.topicID
 	m.TopicTitle = snap.topicTitle
 	m.TokenMode = persistedTabTokenMode(snap.tokenMode)
+	m.AgentPreset = boot.AgentPresetBalanced
 	m.Mode = persistedTabMode(snap.mode)
 	m.ToolApprovalMode = persistedToolApprovalMode(snap.toolApprovalMode)
 	m.Goal = strings.TrimSpace(snap.goal)
@@ -8018,7 +8015,12 @@ func defaultTabSessionProfile() tabSessionProfile {
 
 func tabSessionProfileFromMeta(sessionPath string, meta agent.BranchMeta) tabSessionProfile {
 	profile := defaultTabSessionProfile()
-	profile.tokenMode = boot.NormalizeTokenMode(meta.TokenMode)
+	// Prefer agent_preset; fall back to legacy token_mode for one version.
+	if strings.TrimSpace(meta.AgentPreset) != "" {
+		profile.tokenMode = boot.TokenModeFromAgentPreset(meta.AgentPreset)
+	} else {
+		profile.tokenMode = boot.NormalizeTokenMode(meta.TokenMode)
+	}
 	profile.mode = normalizeTabMode(meta.Mode)
 	profile.toolApprovalMode = normalizeToolApprovalMode(meta.ToolApprovalMode)
 	if profile.toolApprovalMode == control.ToolApprovalAsk && tabModeHasAutoApproveTools(meta.Mode) {

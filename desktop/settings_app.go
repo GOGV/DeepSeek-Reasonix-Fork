@@ -1837,12 +1837,10 @@ func (a *App) rebuildSettingTurnLockedWithModel(setting string, tab *WorkspaceTa
 	if err := rebuildControllerActiveWorkErrorFor(a.controllerForTab(tab), setting); err != nil {
 		return err
 	}
-	ensureWorkspace := a.ensureTabControllerWorkspace
-	if admissionHeld {
-		ensureWorkspace = a.ensureTabControllerWorkspaceAdmissionHeld
-	}
-	if err := ensureWorkspace(tab); err != nil {
-		return err
+	if !admissionHeld {
+		if err := a.ensureTabControllerWorkspace(tab); err != nil {
+			return err
+		}
 	}
 	prevPath := a.reconciledSessionPathForTab(tab)
 	if prevPath == "" {
@@ -1855,9 +1853,6 @@ func (a *App) rebuildSettingTurnLockedWithModel(setting string, tab *WorkspaceTa
 		}
 	}
 	if err := rebuildControllerActiveWorkErrorFor(a.controllerForTab(tab), setting); err != nil {
-		return err
-	}
-	if err := ensureWorkspace(tab); err != nil {
 		return err
 	}
 
@@ -1959,7 +1954,6 @@ func (a *App) buildSettingReplacementController(tab *WorkspaceTab, snap tabRunti
 		WorkspaceRoot:            snap.workspaceRoot,
 		SessionDir:               sessionDirForSnapshot(snap),
 		EffortOverride:           cloneStringPtr(snap.effort),
-		TokenMode:                runtime.tokenMode,
 		SharedHost:               a.lookupSharedHost(snap.sharedHostKey),
 		CleanupPendingReconciler: reconcileDesktopCleanupPending,
 		SubagentParentLive:       a.subagentParentProbeForBuild(tab),
