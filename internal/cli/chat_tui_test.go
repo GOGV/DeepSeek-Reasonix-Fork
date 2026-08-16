@@ -352,21 +352,17 @@ func TestStatusLineWrapAccounting(t *testing.T) {
 	m.state = tuiRunning
 	m.elapsed = 5
 	m.turnTokens = 100
-	// Push a durable inbox item so the working line is longer.
-	m2 := newInboxTestChatTUI(t)
-	m2.state = tuiRunning
-	m2.elapsed = 5
-	m2.turnTokens = 100
-	m2.seedInbox("feedback")
-	m2.width = m.width
-	m2.statusLineCount = m2.computeStatusLineCount(m2.width)
-	runCount := m2.statusLineCount
+	// Push an interject so the working line is longer.
+	m.pendingInterject = []string{"feedback"}
+	m.statusLineCount = m.computeStatusLineCount(m.width)
+	runCount := m.statusLineCount
 	if runCount <= idleCount {
 		t.Fatalf("statusLineCount when running (%d) should be > idle (%d)", runCount, idleCount)
 	}
 
 	// Reset and test that a custom statusline command is also counted.
 	m.state = tuiIdle
+	m.pendingInterject = nil
 	m.statuslineCmd = "custom"
 	m.statuslineOut = "model: claude-3 · ctx: 45% · tokens: 128K · cache: 87% · rate: 1.2s · jobs: 3 running · balance: ¥152.30"
 	m0, _ = m.Update(tea.WindowSizeMsg{Width: 35, Height: 12})
@@ -2679,9 +2675,9 @@ func TestSubmittedInputRecallWithArrowKeys(t *testing.T) {
 }
 
 func TestQueueNavigationWithArrowKeys(t *testing.T) {
-	m := newInboxTestChatTUI(t)
+	m := newTestChatTUI()
 	m.state = tuiRunning
-	m.seedInbox("queued one", "queued two", "queued three")
+	m.pendingInterject = []string{"queued one", "queued two", "queued three"}
 	m.input.SetValue("my draft")
 
 	up := tea.KeyPressMsg{Code: tea.KeyUp}
@@ -2723,9 +2719,9 @@ func TestQueueNavigationWithArrowKeys(t *testing.T) {
 }
 
 func TestQueueNavigationClampAtStart(t *testing.T) {
-	m := newInboxTestChatTUI(t)
+	m := newTestChatTUI()
 	m.state = tuiRunning
-	m.seedInbox("only item")
+	m.pendingInterject = []string{"only item"}
 	m.input.SetValue("draft")
 
 	up := tea.KeyPressMsg{Code: tea.KeyUp}
@@ -2747,7 +2743,7 @@ func TestQueueNavigationClampAtStart(t *testing.T) {
 }
 
 func TestQueueNavigationNoOpWhenEmpty(t *testing.T) {
-	m := newInboxTestChatTUI(t)
+	m := newTestChatTUI()
 	m.state = tuiRunning
 	m.input.SetValue("hello")
 
@@ -2760,9 +2756,9 @@ func TestQueueNavigationNoOpWhenEmpty(t *testing.T) {
 }
 
 func TestQueueEditSavesOnEnter(t *testing.T) {
-	m := newInboxTestChatTUI(t)
+	m := newTestChatTUI()
 	m.state = tuiRunning
-	m.seedInbox("original one", "original two")
+	m.pendingInterject = []string{"original one", "original two"}
 
 	up := tea.KeyPressMsg{Code: tea.KeyUp}
 	model, _ := m.Update(up)
@@ -2777,12 +2773,11 @@ func TestQueueEditSavesOnEnter(t *testing.T) {
 	model, _ = m.Update(enter)
 	m = model.(chatTUI)
 
-	bodies := m.inboxBodies()
-	if bodies[1] != "edited two" {
-		t.Fatalf("queue[1] should be %q, got %q", "edited two", bodies[1])
+	if m.pendingInterject[1] != "edited two" {
+		t.Fatalf("queue[1] should be %q, got %q", "edited two", m.pendingInterject[1])
 	}
-	if bodies[0] != "original one" {
-		t.Fatalf("queue[0] should be unchanged, got %q", bodies[0])
+	if m.pendingInterject[0] != "original one" {
+		t.Fatalf("queue[0] should be unchanged, got %q", m.pendingInterject[0])
 	}
 	if m.queueEditCursor != -1 {
 		t.Fatalf("cursor should reset after enter, got %d", m.queueEditCursor)
@@ -2790,35 +2785,32 @@ func TestQueueEditSavesOnEnter(t *testing.T) {
 }
 
 func TestQueueNewMessageOnEnterDuringRunning(t *testing.T) {
-	m := newInboxTestChatTUI(t)
+	m := newTestChatTUI()
 	m.state = tuiRunning
-	m.seedInbox("existing")
+	m.pendingInterject = []string{"existing"}
 
 	m.input.SetValue("new message")
 	enter := tea.KeyPressMsg{Code: tea.KeyEnter}
 	model, _ := m.Update(enter)
 	m = model.(chatTUI)
 
-	bodies := m.inboxBodies()
-	if len(bodies) != 2 {
-		t.Fatalf("queue should have 2 items, got %d", len(bodies))
+	if len(m.pendingInterject) != 2 {
+		t.Fatalf("queue should have 2 items, got %d", len(m.pendingInterject))
 	}
-	if bodies[1] != "new message" {
-		t.Fatalf("queue[1] should be %q, got %q", "new message", bodies[1])
+	if m.pendingInterject[1] != "new message" {
+		t.Fatalf("queue[1] should be %q, got %q", "new message", m.pendingInterject[1])
 	}
 }
 
 func TestQueuedFoldedPasteExpandsBeforeInterjectSend(t *testing.T) {
 	runner := &recordingTurnRunner{}
 	events := make(chan event.Event, 8)
-	dir := t.TempDir()
 	ctrl := control.New(control.Options{
 		Runner:     runner,
 		Sink:       event.FuncSink(func(e event.Event) { events <- e }),
-		SessionDir: dir,
+		SessionDir: t.TempDir(),
 		Label:      "test",
 	})
-	ctrl.EnsureSessionPath()
 	m := newTestChatTUI()
 	m.ctrl = ctrl
 	m.eventCh = make(chan event.Event, 8)
@@ -2836,11 +2828,10 @@ func TestQueuedFoldedPasteExpandsBeforeInterjectSend(t *testing.T) {
 	model, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	m = model.(chatTUI)
 
-	bodies := m.inboxBodies()
-	if len(bodies) != 1 {
-		t.Fatalf("queue should have 1 item, got %d", len(bodies))
+	if len(m.pendingInterject) != 1 {
+		t.Fatalf("queue should have 1 item, got %d", len(m.pendingInterject))
 	}
-	queued := bodies[0]
+	queued := m.pendingInterject[0]
 	if queued == display {
 		t.Fatalf("queued interject kept the folded placeholder: %q", queued)
 	}
@@ -2854,18 +2845,10 @@ func TestQueuedFoldedPasteExpandsBeforeInterjectSend(t *testing.T) {
 		}
 	}
 
-	// Resume inbox so controller can dispatch after TurnDone.
-	_ = m.ctrl.SetInboxPaused(false)
 	model, _ = m.Update(agentEventMsg(event.Event{Kind: event.TurnDone}))
 	m = model.(chatTUI)
-	// Controller dispatches asynchronously via maybeDispatch; wait briefly.
 	waitForCLIEvent(t, events, event.TurnDone)
 
-	// Admission may start a turn; wait for runner input.
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) && len(runner.inputs) == 0 {
-		time.Sleep(10 * time.Millisecond)
-	}
 	if len(runner.inputs) != 1 {
 		t.Fatalf("runner should receive queued interject, inputs=%q", runner.inputs)
 	}
@@ -2879,9 +2862,9 @@ func TestQueuedFoldedPasteExpandsBeforeInterjectSend(t *testing.T) {
 }
 
 func TestQueueNavigationResetOnNonUpDownKey(t *testing.T) {
-	m := newInboxTestChatTUI(t)
+	m := newTestChatTUI()
 	m.state = tuiRunning
-	m.seedInbox("queued")
+	m.pendingInterject = []string{"queued"}
 
 	up := tea.KeyPressMsg{Code: tea.KeyUp}
 	model, _ := m.Update(up)
@@ -2901,9 +2884,9 @@ func TestQueueNavigationResetOnNonUpDownKey(t *testing.T) {
 }
 
 func TestQueueEditTypingDoesNotResetCursor(t *testing.T) {
-	m := newInboxTestChatTUI(t)
+	m := newTestChatTUI()
 	m.state = tuiRunning
-	m.seedInbox("first", "second")
+	m.pendingInterject = []string{"first", "second"}
 
 	// Navigate up to select the last item.
 	up := tea.KeyPressMsg{Code: tea.KeyUp}
@@ -2925,9 +2908,9 @@ func TestQueueEditTypingDoesNotResetCursor(t *testing.T) {
 }
 
 func TestQueueEditReplaceOnEnter(t *testing.T) {
-	m := newInboxTestChatTUI(t)
+	m := newTestChatTUI()
 	m.state = tuiRunning
-	m.seedInbox("hello")
+	m.pendingInterject = []string{"hello"}
 
 	// Navigate up to select the item.
 	up := tea.KeyPressMsg{Code: tea.KeyUp}
@@ -2944,12 +2927,11 @@ func TestQueueEditReplaceOnEnter(t *testing.T) {
 	model, _ = m.Update(enter)
 	m = model.(chatTUI)
 
-	bodies := m.inboxBodies()
-	if len(bodies) != 1 {
-		t.Fatalf("queue should still have 1 item, got %d", len(bodies))
+	if len(m.pendingInterject) != 1 {
+		t.Fatalf("queue should still have 1 item, got %d", len(m.pendingInterject))
 	}
-	if bodies[0] != "world" {
-		t.Fatalf("queue[0] should be %q, got %q", "world", bodies[0])
+	if m.pendingInterject[0] != "world" {
+		t.Fatalf("queue[0] should be %q, got %q", "world", m.pendingInterject[0])
 	}
 	if m.queueEditCursor != -1 {
 		t.Fatalf("cursor should reset after enter, got %d", m.queueEditCursor)
@@ -2957,9 +2939,9 @@ func TestQueueEditReplaceOnEnter(t *testing.T) {
 }
 
 func TestQueueIndicatorRendering(t *testing.T) {
-	m := newInboxTestChatTUI(t)
+	m := newTestChatTUI()
 	m.state = tuiRunning
-	m.seedInbox("first msg", "second msg")
+	m.pendingInterject = []string{"first msg", "second msg"}
 
 	qi := m.renderQueueIndicator()
 	if qi == "" {
@@ -2981,16 +2963,12 @@ func TestQueueIndicatorRendering(t *testing.T) {
 }
 
 func TestQueueIndicatorHiddenWhenIdle(t *testing.T) {
-	m := newInboxTestChatTUI(t)
+	m := newTestChatTUI()
 	m.state = tuiIdle
-	// Idle sessions with a recovered/paused inbox still show the shelf so the
-	// user can inspect it; empty inboxes stay hidden.
+	m.pendingInterject = []string{"queued"}
+
 	if qi := m.renderQueueIndicator(); qi != "" {
-		t.Fatalf("queue indicator should be empty when inbox empty, got %q", qi)
-	}
-	m.seedInbox("queued")
-	if qi := m.renderQueueIndicator(); qi == "" {
-		t.Fatal("queue indicator should show durable items even when idle")
+		t.Fatalf("queue indicator should be empty when idle, got %q", qi)
 	}
 }
 
@@ -3149,10 +3127,12 @@ func TestForceGotoBottomScrollsWithoutTranscriptChange(t *testing.T) {
 	if cur.forceGotoBottom {
 		t.Fatal("forceGotoBottom should be cleared after scrolling")
 	}
-	assertLegacyViewportClearCmd(t, cmd)
+	if cmd != nil {
+		t.Fatal("forceGotoBottom should rely on the renderer diff, not request a scroll clear command")
+	}
 }
 
-func TestSessionSwitchSuppressesOneClearScreen(t *testing.T) {
+func TestSessionSwitchRebuildNeedsNoScrollClear(t *testing.T) {
 	ctrl := control.New(control.Options{})
 	ch := make(chan event.Event, 1)
 	notice := agentEventMsg(event.Event{Kind: event.Notice, Level: event.LevelInfo, Text: "line"})
@@ -3174,27 +3154,29 @@ func TestSessionSwitchSuppressesOneClearScreen(t *testing.T) {
 		t.Fatal("wheel-up should break the bottom pin")
 	}
 
-	cur.sessionSwitch = true
-	cur.forceGotoBottom = true
-	cur.transcriptDirty = false
+	cur.replayActiveBranch("switched branch")
 	cur, cmd := adv(cur, tea.WindowSizeMsg{Width: 80, Height: 8})
 
 	if cmd != nil {
-		t.Fatal("session switch rebuild should suppress the ClearScreen scroll-jump workaround once")
-	}
-	if cur.sessionSwitch {
-		t.Fatal("sessionSwitch should be cleared after one Update")
+		t.Fatal("session switch rebuild should rely on the renderer diff, not request a scroll clear command")
 	}
 	if !cur.viewport.AtBottom() {
 		t.Fatalf("session switch should still land at bottom, YOffset=%d", cur.viewport.YOffset())
 	}
+	if out := strings.Join(cur.transcript, "\n"); !strings.Contains(out, "switched branch") || strings.Contains(out, "line") {
+		t.Fatalf("session switch transcript was not replaced cleanly:\n%s", out)
+	}
+}
 
-	cur = next(cur, tea.MouseWheelMsg{Button: tea.MouseWheelUp})
-	cur.forceGotoBottom = true
-	cur, cmd = adv(cur, tea.WindowSizeMsg{Width: 80, Height: 8})
-	assertLegacyViewportClearCmd(t, cmd)
-	if cur.sessionSwitch {
-		t.Fatal("sessionSwitch should remain false after the suppressed cycle")
+func TestConfirmClearContextKeepsSemanticClearScreen(t *testing.T) {
+	m := newTestChatTUI()
+	m.ctrl = control.New(control.Options{})
+	_, cmd := m.confirmClearContext()
+	if cmd == nil {
+		t.Fatal("/clear should still request a semantic full-screen clear")
+	}
+	if got, want := fmt.Sprintf("%T", cmd()), fmt.Sprintf("%T", tea.ClearScreen()); got != want {
+		t.Fatalf("/clear command message = %s, want %s", got, want)
 	}
 }
 
@@ -3256,20 +3238,24 @@ func TestChooserFreeTextWideInputChangeRequestsClearScreen(t *testing.T) {
 	}
 }
 
-func TestReplayActiveBranchClearsPlanModeAndMarksSessionSwitch(t *testing.T) {
+func TestReplayActiveBranchClearsPlanModeAndRebuildsViewport(t *testing.T) {
 	m := newTestChatTUI()
 	m.ctrl = control.New(control.Options{})
 	m.planMode = true
 	m.ctrl.SetPlanMode(true)
-	m.sessionSwitch = false
+	m.transcript = []string{"stale session content"}
+	m.wrappedLines = []string{"stale session content"}
 
 	m.replayActiveBranch("switched branch")
 
 	if m.planMode || m.ctrl.PlanMode() {
 		t.Fatalf("replay should clear plan mode on both TUI and controller, tui=%v controller=%v", m.planMode, m.ctrl.PlanMode())
 	}
-	if !m.sessionSwitch {
-		t.Fatal("replay should mark the next Update as a session switch")
+	if !m.forceGotoBottom {
+		t.Fatal("replay should request the rebuilt viewport to land at the bottom")
+	}
+	if out := strings.Join(m.transcript, "\n"); strings.Contains(out, "stale session content") || !strings.Contains(out, "switched branch") {
+		t.Fatalf("replay transcript = %q", out)
 	}
 }
 
