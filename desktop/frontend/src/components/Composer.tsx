@@ -3250,6 +3250,7 @@ export function Composer({
           title: session.title || session.topicTitle || session.preview || "Untitled",
           preview: session.preview,
           turns: session.turns,
+          turnsState: session.turnsState,
           createdAt: session.createdAt,
           lastActivityAt: session.lastActivityAt,
         },
@@ -4196,18 +4197,20 @@ export function Composer({
                     // PR-C2: hover preview uses only the SessionMeta fields we
                     // already have on hand — no extra PreviewSession call, no
                     // backend round-trip, no read of the full transcript.
-                    const turns = typeof session.turns === "number";
+                    const turnsKnown = session.turnsState !== "unknown" && typeof session.turns === "number";
+                    const turnsPending = session.turnsState === "unknown";
                     const ts = session.lastActivityAt || session.modTime || session.createdAt;
                     const preview = truncatePreview(session.preview);
                     const pathText = session.workspaceRoot || session.path;
                     const tooltipLabel =
-                      turns || ts || preview || pathText ? (
+                      turnsKnown || turnsPending || ts || preview || pathText ? (
                         <div className="past-chat-hover">
                           <div className="past-chat-hover__title">{pastChatTitle(session)}</div>
                           {preview && <div className="past-chat-hover__preview">{preview}</div>}
-                          {(turns || ts) && (
+                          {(turnsKnown || turnsPending || ts) && (
                             <div className="past-chat-hover__meta">
-                              {turns && <span>{t("composer.sessionTurns", { n: session.turns })}</span>}
+                              {turnsPending && <span>{t("history.indexing")}</span>}
+                              {turnsKnown && <span>{t("composer.sessionTurns", { n: session.turns })}</span>}
                               {ts && <span>· {fmtSessionTime(ts)}</span>}
                             </div>
                           )}
@@ -4227,7 +4230,11 @@ export function Composer({
                           <MessageSquare size={13} className="filemenu__icon" />
                           <span className="slashmenu__name slashmenu__name--file">
                             {pastChatTitle(session)}
-                            {turns ? ` (${t("composer.sessionTurns", { n: session.turns })})` : ""}
+                            {turnsPending
+                              ? ` (${t("history.indexing")})`
+                              : turnsKnown
+                                ? ` (${t("composer.sessionTurns", { n: session.turns })})`
+                                : ""}
                           </span>
                         </button>
                       </Tooltip>
@@ -4361,7 +4368,11 @@ export function Composer({
                   <MessageSquare size={15} />
                   <span>
                     {ref.title}
-                    {typeof ref.turns === "number" ? ` (${t("composer.sessionTurns", { n: ref.turns })})` : ""}
+                    {ref.turnsState === "unknown"
+                      ? ` (${t("history.indexing")})`
+                      : typeof ref.turns === "number"
+                        ? ` (${t("composer.sessionTurns", { n: ref.turns })})`
+                        : ""}
                   </span>
                 </span>
               </Tooltip>

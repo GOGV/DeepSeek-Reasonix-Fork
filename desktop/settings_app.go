@@ -1837,12 +1837,10 @@ func (a *App) rebuildSettingTurnLockedWithModel(setting string, tab *WorkspaceTa
 	if err := rebuildControllerActiveWorkErrorFor(a.controllerForTab(tab), setting); err != nil {
 		return err
 	}
-	ensureWorkspace := a.ensureTabControllerWorkspace
-	if admissionHeld {
-		ensureWorkspace = a.ensureTabControllerWorkspaceAdmissionHeld
-	}
-	if err := ensureWorkspace(tab); err != nil {
-		return err
+	if !admissionHeld {
+		if err := a.ensureTabControllerWorkspace(tab); err != nil {
+			return err
+		}
 	}
 	prevPath := a.reconciledSessionPathForTab(tab)
 	if prevPath == "" {
@@ -1855,9 +1853,6 @@ func (a *App) rebuildSettingTurnLockedWithModel(setting string, tab *WorkspaceTa
 		}
 	}
 	if err := rebuildControllerActiveWorkErrorFor(a.controllerForTab(tab), setting); err != nil {
-		return err
-	}
-	if err := ensureWorkspace(tab); err != nil {
 		return err
 	}
 
