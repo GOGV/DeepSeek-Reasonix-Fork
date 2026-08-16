@@ -204,7 +204,6 @@ type StreamAttemptJournal = {
 export type ControllerLiveStore = {
   subscribe: (tabId: string | undefined, listener: () => void) => () => void;
   getSnapshot: (tabId: string | undefined) => LiveStream | undefined;
-  getModelActiveAt?: (tabId: string | undefined) => number | undefined;
 };
 export type MessageActionScope = "fork" | "summ-from" | "summ-upto" | "conversation" | "code" | "both";
 export type MessageActionState = { turn: number; scope: MessageActionScope };
@@ -230,7 +229,7 @@ type ModelSwitchQueueState = {
 const HISTORY_PAGE_TURNS = 60;
 
 export type Item =
-  | { kind: "user"; id: string; submissionId?: string; text: string; submitText?: string; failed?: boolean; createdAt?: number; checkpointTurn?: number }
+  | { kind: "user"; id: string; text: string; submitText?: string; failed?: boolean; createdAt?: number; checkpointTurn?: number }
   | { kind: "assistant"; id: string; text: string; reasoning: string; streaming: boolean; reasoningComplete?: boolean; reasoningDurationMs?: number; workDurationMs?: number; memoryCitations?: MemoryCitation[] }
   | { kind: "phase"; id: string; text: string }
   | { kind: "notice"; id: string; level: "info" | "warn"; text: string; detail?: string; title?: string; variant?: "delivery"; action?: "continue_delivery"; decisionReceipt?: WireDecisionReceipt }
@@ -362,42 +361,20 @@ interface State {
   historyTotalTurns: number;
   historyHasOlder: boolean;
   historyOlderLoading: boolean;
+  historyRevision?: number;
+  historyDigest?: string;
   backendActivationPending: boolean;
   messageAction?: MessageActionState;
   currentAssistant?: string;
   live?: LiveStream;
   pendingUser?: string;
-  pendingSubmissionId?: string;
   deliveryRecoveryActive: boolean;
   discardTurn?: boolean;
   turnStartAt: number;
-  turnDoneAt: number;
-  // Completion tokens accumulated across executor usage events within the
-  // current turn. ReasoningTokens is a subset of CompletionTokens.
-  turnOutputTokens: number;
-  turnOutputChars: number;
-  // Live text/reasoning characters already covered by the accumulated usage.
-  // This lets the composer estimate only the in-flight provider request.
-  turnOutputCharsAtUsage: number;
-  // True when any output-token count in the current turn is estimated.
-  turnOutputEstimated: boolean;
-  // Active provider-output intervals for the current turn. Tool execution and
-  // gaps between provider requests are intentionally excluded from TPS.
-  turnModelActiveAt?: number;
-  turnModelActiveMs: number;
   // Time spent waiting on the user (approval/ask) within the current turn.
   // Closed intervals accumulate here; an open interval uses promptWaitStartedAt
   // so background tabs keep counting while not rendered by Composer.
   turnWaitAccumMs: number;
-  // Last completed turn's values — preserved across turn boundaries so the
-  // status bar can display the most recent completed turn's TPS and token
-  // counts until the current turn finishes and overwrites them.
-  lastTurnOutputTokens: number;
-  lastTurnStartAt: number;
-  lastTurnDoneAt: number;
-  lastTurnWaitAccumMs: number;
-  lastTurnModelMs: number;
-  lastTurnOutputEstimated: boolean;
   promptWaitStartedAt?: number;
   // promptEventClock() reading taken when the CURRENT pending prompt first
   // arrived. Orders the prompt against reconciliation snapshots so a snapshot
@@ -479,19 +456,7 @@ export const initialState: State = {
   deliveryRecoveryActive: false,
   promptEpoch: 0,
   turnStartAt: 0,
-  turnDoneAt: 0,
-  turnOutputTokens: 0,
-  turnOutputChars: 0,
-  turnOutputCharsAtUsage: 0,
-  turnOutputEstimated: false,
-  turnModelActiveMs: 0,
   turnWaitAccumMs: 0,
-  lastTurnOutputTokens: 0,
-  lastTurnStartAt: 0,
-  lastTurnDoneAt: 0,
-  lastTurnWaitAccumMs: 0,
-  lastTurnModelMs: 0,
-  lastTurnOutputEstimated: false,
   turnTokens: 0,
   turnTotalTokens: 0,
   turnCost: 0,
@@ -586,6 +551,8 @@ export function metaFromTab(tab: TabMeta, existing?: Meta): Meta {
     workspaceName: tab.workspaceName || existing?.workspaceName,
     workspacePath: tab.workspacePath || tab.workspaceRoot || existing?.workspacePath,
     sessionPath: tab.sessionPath !== undefined ? tab.sessionPath : existing?.sessionPath,
+    sessionRevision: tab.sessionRevision !== undefined ? tab.sessionRevision : existing?.sessionRevision,
+    sessionDigest: tab.sessionDigest !== undefined ? tab.sessionDigest : existing?.sessionDigest,
     gitBranch: tab.gitBranch || existing?.gitBranch,
     autoApproveTools,
     bypass: autoApproveTools,
@@ -624,6 +591,8 @@ export function sameMeta(a?: Meta, b?: Meta): boolean {
     a.workspaceName === b.workspaceName &&
     a.workspacePath === b.workspacePath &&
     a.sessionPath === b.sessionPath &&
+    a.sessionRevision === b.sessionRevision &&
+    a.sessionDigest === b.sessionDigest &&
     a.gitBranch === b.gitBranch &&
     a.imageInputEnabled === b.imageInputEnabled &&
     a.autoApproveTools === b.autoApproveTools &&
@@ -655,13 +624,6 @@ export function normalizeTurnSubmit(displayText: string, submitText: string): {
   const submit = submitText.trim();
   if (!submit) throw new Error("Message cannot be empty.");
   return { display, submit };
-}
-
-const frontendSubmissionEpoch = typeof globalThis.crypto?.randomUUID === "function"
-  ? globalThis.crypto.randomUUID()
-  : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
-export function createTurnSubmissionId(tabId: string, sessionGen: number, seq: number, runtimeEpoch?: string): string {
-  return JSON.stringify([frontendSubmissionEpoch, tabId, sessionGen, runtimeEpoch ?? "", seq]);
 }
 
 export function acceptsRuntimeEventEpoch(acceptedEpoch: string | undefined, eventEpoch: string | undefined): boolean {
@@ -711,11 +673,28 @@ function hasCachedLiveTurn(state: State | undefined): boolean {
   );
 }
 
-function hasReusableCachedTranscript(state: State | undefined, sessionPath?: string): boolean {
+function hasReusableCachedTranscript(state: State | undefined, sessionPath?: string, revision?: number, digest?: string): boolean {
   if (!state || state.items.length === 0) return false;
   const expectedSessionPath = (sessionPath ?? "").trim();
   if (!expectedSessionPath) return true;
-  return (state.meta?.sessionPath ?? "").trim() === expectedSessionPath;
+  if ((state.meta?.sessionPath ?? "").trim() !== expectedSessionPath) return false;
+  if (typeof revision === "number" && revision > 0) {
+    return state.historyRevision === revision && (digest ?? "") === (state.historyDigest ?? "");
+  }
+  if ((digest ?? "").trim() !== "") return state.historyDigest === digest;
+  // A cached page with a known fingerprint must not be reused when the
+  // backend temporarily cannot provide one (for example while its metadata
+  // sidecar is being atomically replaced). Reloading is the only way to avoid
+  // presenting a stale persisted transcript as current.
+  return state.historyRevision === undefined && !state.historyDigest;
+}
+
+function historyPageMatchesMeta(page: HistoryPage, meta: Meta): boolean {
+  const expectedDigest = (meta.sessionDigest ?? "").trim();
+  if (expectedDigest && page.digest !== expectedDigest) return false;
+  const expectedRevision = meta.sessionRevision ?? 0;
+  if (expectedRevision > 0 && page.revision !== expectedRevision) return false;
+  return true;
 }
 
 /** Mirrors Go backend's ReadOnly() hints. */
@@ -774,10 +753,9 @@ function compactArchivedToolItems(items: Item[]): Item[] {
 type Action =
   | { type: "event"; e: WireEvent }
   | { type: "stream_batch"; segments: StreamSegment[] }
-  | { type: "user"; text: string; submitText?: string; seq: number; submissionId: string; deliveryRecovery?: boolean }
+  | { type: "user"; text: string; submitText?: string; seq: number; deliveryRecovery?: boolean }
   | { type: "unsend" }
-  | { type: "send_confirmed"; submissionId: string }
-  | { type: "send_failed"; submissionId: string; error: string }
+  | { type: "send_failed"; error: string }
   | { type: "backend_status"; running: boolean; pendingPrompt?: boolean; backgroundJobs?: number; cancelRequested?: boolean; cancellable?: boolean; snapshotAt?: number }
   | { type: "cancel_requested" }
   | { type: "meta"; meta: Meta }
@@ -798,6 +776,7 @@ type Action =
   | { type: "history_page"; page: HistoryPage; mode: "replace" | "prepend" }
   | { type: "history_older_start" }
   | { type: "history_older_error" }
+  | { type: "history_checkpoint_turns"; turns: number[] }
   | { type: "local_notice"; level: "info" | "warn"; text: string }
   | { type: "clearApproval" }
   | { type: "clearAsk" }
@@ -944,14 +923,18 @@ export function historyMessagesToItems(messages: HistoryMessage[], idPrefix: str
   return { items, seq };
 }
 
-function applyTurnCheckpoint(items: Item[], submissionId: string | undefined, turn: number | undefined): Item[] {
-  if (!submissionId) return items;
-  const validTurn = turn !== undefined && Number.isInteger(turn) && turn >= 0;
+function mergeHistoryCheckpointTurns(items: Item[], turns: number[], startTurn = 0): Item[] {
+  if (!turns.some((turn) => turn >= 0)) return items;
+  const offset = Math.max(0, Math.floor(startTurn));
+  let userIndex = 0;
   let changed = false;
   const next = items.map((item) => {
-    if (item.kind !== "user" || item.submissionId !== submissionId) return item;
+    if (item.kind !== "user") return item;
+    const turn = turns[offset + userIndex];
+    userIndex += 1;
+    if (turn == null || turn < 0 || item.checkpointTurn === turn) return item;
     changed = true;
-    return { ...item, submissionId: undefined, checkpointTurn: item.checkpointTurn ?? (validTurn ? turn : undefined) };
+    return { ...item, checkpointTurn: turn };
   });
   return changed ? next : items;
 }
@@ -1027,16 +1010,14 @@ function liveReasoningDurationMs(live?: LiveStream): number | undefined {
 function applyDeltaSegments(s: State, segments: StreamSegment[]): State {
   const { items, id, seq } = ensureAssistant(s);
   const base = s.live?.id === id ? s.live : { id, text: "", reasoning: "", reasoningComplete: false };
-  const now = Date.now();
-  const deltaChars = segments.reduce((total, segment) => total + segment.delta.length, 0);
-  const next = { ...s, items, live: applyLiveSegments(base, segments, now), currentAssistant: id, seq, turnOutputChars: s.turnOutputChars + deltaChars };
-  return deltaChars > 0 ? beginTurnModelActivity(next, now) : next;
+  return { ...s, items, live: applyLiveSegments(base, segments, Date.now()), currentAssistant: id, seq };
 }
 
 // applyStreamBatch is the stream_batch action: one frame's deltas, one reducer
 // pass, one notification. Mirrors applyEvent's preamble for delta events.
 function applyStreamBatch(s: State, segments: StreamSegment[]): State {
   if (s.discardTurn) return s;
+  if (s.pendingUser !== undefined) s = flushPendingUser(s);
   if (s.retry) s = { ...s, retry: undefined };
   return applyDeltaSegments(s, segments);
 }
@@ -1083,61 +1064,29 @@ function endPromptWaitIfIdle(s: State, now = Date.now()): State {
   return endPromptWait(s, now);
 }
 
-function resetTurnTiming(now = Date.now()): Pick<State, "turnStartAt" | "turnDoneAt" | "turnWaitAccumMs" | "promptWaitStartedAt" | "turnTokens" | "turnTotalTokens" | "turnOutputTokens" | "turnOutputChars" | "turnOutputCharsAtUsage" | "turnOutputEstimated" | "turnModelActiveAt" | "turnModelActiveMs" | "turnCost" | "turnArgChars"> {
+function resetTurnTiming(now = Date.now()): Pick<State, "turnStartAt" | "turnWaitAccumMs" | "promptWaitStartedAt" | "turnTokens" | "turnTotalTokens" | "turnCost" | "turnArgChars"> {
   return {
     turnStartAt: now,
-    turnDoneAt: 0,
     turnWaitAccumMs: 0,
     promptWaitStartedAt: undefined,
     turnTokens: 0,
     turnTotalTokens: 0,
-    turnOutputTokens: 0,
-    turnOutputChars: 0,
-    turnOutputCharsAtUsage: 0,
-    turnOutputEstimated: false,
-    turnModelActiveAt: undefined,
-    turnModelActiveMs: 0,
     turnCost: 0,
     turnArgChars: 0,
   };
 }
 
-function confirmPendingUser(s: State, submissionId: string | undefined): State {
-  if (!submissionId || s.pendingSubmissionId !== submissionId) return s;
-  return { ...s, pendingUser: undefined, pendingSubmissionId: undefined };
-}
-
-function beginTurnModelActivity(s: State, now = Date.now()): State {
-  return s.turnModelActiveAt && s.turnModelActiveAt > 0
-    ? s
-    : { ...s, turnModelActiveAt: now };
-}
-
-function endTurnModelActivity(s: State, now = Date.now()): State {
-  if (!s.turnModelActiveAt || s.turnModelActiveAt <= 0) return s;
+function flushPendingUser(s: State): State {
+  if (s.pendingUser === undefined) return s;
+  const lastItem = s.items[s.items.length - 1];
+  if (lastItem?.kind === "user" && lastItem.text === s.pendingUser) {
+    return { ...s, pendingUser: undefined };
+  }
   return {
     ...s,
-    turnModelActiveAt: undefined,
-    turnModelActiveMs: Math.max(0, s.turnModelActiveMs) + Math.max(0, now - s.turnModelActiveAt),
-  };
-}
-
-function snapshotCompletedTurnTelemetry(s: State, now = Date.now()): State {
-  const settled = endTurnModelActivity(s, now);
-  const liveChars = (settled.live?.text.length ?? 0) + (settled.live?.reasoning.length ?? 0);
-  const inFlightChars = settled.turnOutputTokens > 0
-    ? Math.max(0, liveChars - settled.turnOutputCharsAtUsage) + settled.turnArgChars
-    : settled.turnOutputChars + settled.turnArgChars;
-  const estimatedInFlightTokens = Math.round(inFlightChars / 4);
-  return {
-    ...settled,
-    turnDoneAt: now,
-    lastTurnOutputTokens: settled.turnOutputTokens + estimatedInFlightTokens,
-    lastTurnStartAt: settled.turnStartAt,
-    lastTurnDoneAt: now,
-    lastTurnWaitAccumMs: settled.turnWaitAccumMs,
-    lastTurnModelMs: settled.turnModelActiveMs,
-    lastTurnOutputEstimated: settled.turnOutputEstimated || estimatedInFlightTokens > 0 || (settled.turnOutputTokens === 0 && settled.turnOutputChars > 0),
+    seq: s.seq + 1,
+    items: [...s.items, { kind: "user", id: `u${s.seq}`, text: s.pendingUser, createdAt: Date.now() }],
+    pendingUser: undefined,
   };
 }
 
@@ -1226,9 +1175,8 @@ function applyStreamAttempt(s: State, e: WireEvent): State {
   if (!sa?.id || !sa.action) return s;
   switch (sa.action) {
     case "begin": {
-      // Snapshot only what this attempt may replace in the visible stream.
-      // Provider activity timing is closed at discard but remains accumulated so
-      // retry backoff is not counted in the completed TPS denominator.
+      // Snapshot only what this attempt may mutate: live text/reasoning and
+      // turnArgChars. Concurrent non-sampling events remain outside the journal.
       const baselineLive = s.live
         ? {
             id: s.live.id,
@@ -1277,7 +1225,7 @@ function applyStreamAttempt(s: State, e: WireEvent): State {
           ? { ...s.live, text: "", reasoning: "", reasoningComplete: false, reasoningStartedAt: undefined, reasoningCompletedAt: undefined }
           : undefined;
       return {
-        ...endTurnModelActivity(s),
+        ...s,
         items,
         live,
         turnArgChars: journal.baselineTurnArgChars,
@@ -1353,32 +1301,20 @@ function applyExtensionNotification(s: State, surface: WireExtensionSurface): St
 
 function applyEvent(s: State, e: WireEvent): State {
   if (s.discardTurn) {
-    if (e.kind === "turn_done") {
-      return {
-        ...s,
-        items: applyTurnCheckpoint(s.items, e.submissionId, e.checkpointTurn),
-        discardTurn: false,
-        running: false,
-        turnActive: false,
-        pendingPrompt: false,
-        cancelRequested: false,
-        cancellable: false,
-        currentAssistant: undefined,
-        live: undefined,
-      };
-    }
+    if (e.kind === "turn_done") return { ...s, discardTurn: false, running: false, turnActive: false, pendingPrompt: false, cancelRequested: false, cancellable: false, currentAssistant: undefined, live: undefined };
     return s;
   }
-  s = confirmPendingUser(s, e.submissionId);
   if (e.kind === "mcp_surface_ready") {
-    // Background readiness remains a no-op unless the sink explicitly
-    // correlates it to this submit in the common preamble above.
+    // Background-only events must not confirm an optimistic user bubble.
     return s;
   }
   if (e.kind === "extension_surface" || e.kind === "extension_status") {
-    // Sidecar publications without exact sink correlation remain background-
-    // only and must not clear the retry indicator.
+    // Sidecar surface publications are background-only too: they must neither
+    // confirm an optimistic user bubble nor clear the retry indicator.
     return applyExtensionSurfaceEvent(s, e.extension);
+  }
+  if (s.pendingUser !== undefined && e.kind !== "turn_done") {
+    s = flushPendingUser(s);
   }
   if (e.kind === "retrying") {
     // Retrying is emitted synchronously from inside the foreground provider
@@ -1407,13 +1343,15 @@ function applyEvent(s: State, e: WireEvent): State {
   if (s.retry) s = { ...s, retry: undefined };
   switch (e.kind) {
     case "turn_started": {
-      // Pre-create an empty assistant bubble
+      // Flush the user message and pre-create an empty assistant bubble
       // immediately so the user sees their message + a blinking cursor the
       // instant the backend acknowledges the turn — no dead gap waiting for
       // the first text/reasoning token.
-      const { items, id, seq } = ensureAssistant(s);
+      let cur: State = s;
+      if (cur.pendingUser !== undefined) cur = flushPendingUser(cur);
+      const { items, id, seq } = ensureAssistant(cur);
       return {
-        ...s,
+        ...cur,
         items,
         currentAssistant: id,
         seq,
@@ -1427,9 +1365,8 @@ function applyEvent(s: State, e: WireEvent): State {
       };
     }
     case "text":
-    case "reasoning": {
+    case "reasoning":
       return applyDeltaSegments(s, [{ kind: e.kind, delta: e.text ?? e.reasoning ?? "" }]);
-    }
     case "message": {
       const existingAssistant =
         s.currentAssistant === undefined
@@ -1442,16 +1379,13 @@ function applyEvent(s: State, e: WireEvent): State {
           existingAssistant && existingAssistant.text.trim() === "" && existingAssistant.reasoning.trim() === "" && !existingAssistant.memoryCitations?.length
             ? s.items.filter((it) => !(it.kind === "assistant" && it.id === existingAssistant.id))
             : s.items;
-        return { ...endTurnModelActivity(s), items, live: undefined, currentAssistant: undefined, turnOutputCharsAtUsage: 0 };
+        return { ...s, items, live: undefined, currentAssistant: undefined };
       }
+      const { items, id, seq } = ensureAssistant(s);
       const now = Date.now();
-      const settled = endTurnModelActivity(s, now);
-      const { items, id, seq } = ensureAssistant(settled);
-      const streamedChars = settled.live?.id === id ? settled.live.text.length + settled.live.reasoning.length : 0;
-      const turnOutputChars = Math.max(0, settled.turnOutputChars - streamedChars + text.length + reasoning.length);
-      const completedLive = settled.live?.id === id ? completeLiveReasoning({ ...settled.live, text, reasoning }, now) : undefined;
+      const completedLive = s.live?.id === id ? completeLiveReasoning({ ...s.live, text, reasoning }, now) : undefined;
       const reasoningDurationMs = liveReasoningDurationMs(completedLive);
-      const workDurationMs = currentTurnDurationMs(settled, now);
+      const workDurationMs = currentTurnDurationMs(s, now);
       const next = items.map((it) =>
         it.kind === "assistant" && it.id === id
           ? (() => {
@@ -1469,7 +1403,7 @@ function applyEvent(s: State, e: WireEvent): State {
             })()
           : it,
       );
-      return { ...settled, items: next, live: undefined, currentAssistant: undefined, turnOutputChars, turnOutputCharsAtUsage: 0, seq };
+      return { ...s, items: next, live: undefined, currentAssistant: undefined, seq };
     }
     case "tool_dispatch": {
       const t = e.tool;
@@ -1480,58 +1414,57 @@ function applyEvent(s: State, e: WireEvent): State {
       // zero visible activity, indistinguishable from a hang. The full
       // dispatch that follows merges by ID and fills in args/summary.
       if (t.partial) {
-        const activeState = t.parentId ? s : beginTurnModelActivity(s);
         const turnArgChars = t.argChars && t.argChars > 0 ? t.argChars : s.turnArgChars;
         // Some OpenAI-compatible streams surface the call name before its ID.
         // Without a stable ID the card could never be merged with the full
         // dispatch (a synthetic `tool${seq}` id would orphan it as a forever-
         // running duplicate), so count the progress but wait for the ID before
         // creating the card.
-        if (!t.id) return { ...activeState, turnArgChars };
+        if (!t.id) return { ...s, turnArgChars };
         const id = t.id;
-        const idx = activeState.items.findIndex((it) => it.kind === "tool" && it.id === id);
+        const idx = s.items.findIndex((it) => it.kind === "tool" && it.id === id);
         if (idx >= 0) {
-          const next = [...activeState.items];
+          const next = [...s.items];
           const it = next[idx];
           if (it.kind === "tool" && it.status === "running" && !it.args) {
             const prior = it;
             next[idx] = { ...it, argChars: t.argChars || it.argChars };
-            return noteToolInJournal({ ...activeState, items: next, turnArgChars }, id, true, prior, {
+            return noteToolInJournal({ ...s, items: next, turnArgChars }, id, true, prior, {
               attemptId: t.attemptId, parentId: t.parentId, partial: true,
             });
           }
-          return { ...activeState, turnArgChars };
+          return { ...s, turnArgChars };
         }
         return noteToolInJournal({
-          ...activeState,
+          ...s,
           turnArgChars,
-          seq: activeState.seq + 1,
-          items: [...activeState.items, { kind: "tool", id, name: t.name, args: "", readOnly: t.readOnly, resolvedName: t.resolvedName, capabilityId: t.capabilityId, status: "running", argChars: t.argChars || undefined, parentId: t.parentId, subagentProgress: SUBAGENT_PROGRESS_TOOLS.has(t.name) ? freshSubagentProgress() : undefined }],
+          seq: s.seq + 1,
+          items: [...s.items, { kind: "tool", id, name: t.name, args: "", readOnly: t.readOnly, resolvedName: t.resolvedName, capabilityId: t.capabilityId, status: "running", argChars: t.argChars || undefined, parentId: t.parentId, subagentProgress: SUBAGENT_PROGRESS_TOOLS.has(t.name) ? freshSubagentProgress() : undefined }],
         }, id, false, undefined, { attemptId: t.attemptId, parentId: t.parentId, partial: true });
       }
-      const settled = t.parentId ? s : endTurnModelActivity(s);
       const id = t.id || `tool${s.seq}`;
-      const idx = settled.items.findIndex((it) => it.kind === "tool" && it.id === id);
+      const idx = s.items.findIndex((it) => it.kind === "tool" && it.id === id);
       if (idx >= 0) {
-        const next = [...settled.items];
+        const next = [...s.items];
         const it = next[idx];
         if (it.kind === "tool") {
           const args = t.args ? t.args : it.args;
           const fileDiff = fileDiffFromWire(t);
           const summary = summarizeFileDiff(fileDiff) || summarize(t.name, args) || (t.name === it.name && args === it.args ? it.summary : undefined);
-          next[idx] = { ...it, name: t.name, args, readOnly: t.readOnly, resolvedName: t.resolvedName ?? it.resolvedName, capabilityId: t.capabilityId ?? it.capabilityId, profile: t.profile ?? it.profile, summary, fileDiff, argChars: undefined, isShell: it.isShell || t.name === "bash" || id.startsWith("shell-"), execution: t.execution ?? it.execution, subagentProgress: it.subagentProgress ?? (SUBAGENT_PROGRESS_TOOLS.has(t.name) ? freshSubagentProgress() : undefined) };
+          next[idx] = { ...it, name: t.name, args, readOnly: t.readOnly, resolvedName: t.resolvedName ?? it.resolvedName, capabilityId: t.capabilityId ?? it.capabilityId, profile: t.profile ?? it.profile, summary, fileDiff, argChars: undefined, subagentProgress: it.subagentProgress ?? (SUBAGENT_PROGRESS_TOOLS.has(t.name) ? freshSubagentProgress() : undefined) };
         }
         if (t.parentId) touchSubagentParent(next, t.parentId);
-        return { ...settled, items: next };
+        // Full dispatches are committed work — never journal them as speculative.
+        return { ...s, items: next };
       }
       const args = t.args ?? "";
       const fileDiff = fileDiffFromWire(t);
       const created: ToolItem = { kind: "tool", id, name: t.name, args, readOnly: t.readOnly, resolvedName: t.resolvedName, capabilityId: t.capabilityId, status: "running", summary: summarizeFileDiff(fileDiff) || summarize(t.name, args), fileDiff, isShell: t.name === "bash" || id.startsWith("shell-"), execution: t.execution, parentId: t.parentId, profile: t.profile, subagentProgress: SUBAGENT_PROGRESS_TOOLS.has(t.name) ? freshSubagentProgress() : undefined };
-      const items = [...settled.items, created];
+      const items = [...s.items, created];
       // A sub-agent call nested under a task card refreshes that card's
       // recent activity and switches its phase to "tool".
       if (t.parentId) touchSubagentParent(items, t.parentId);
-      return { ...settled, seq: settled.seq + 1, items };
+      return { ...s, seq: s.seq + 1, items };
     }
     case "tool_result": {
       const t = e.tool;
@@ -1615,42 +1548,29 @@ function applyEvent(s: State, e: WireEvent): State {
     case "usage": {
       if (!countsTowardCurrentTurn(s)) return s;
       const updateContextGauge = updatesContextGauge(e.usage);
-      // Only executor usage belongs to the foreground model stream. Planner,
-      // subagent, and auxiliary usage still contributes to session totals and
-      // usageSeq, but must not close or inflate the executor TPS interval.
-      const settled = updateContextGauge ? endTurnModelActivity(s) : s;
       // Prefer Context* (latest attempt) over billable aggregates when multi-
       // attempt sampling recovery folds several provider calls into one Usage.
       // Matches Controller.ContextSnapshot: latest prompt + completion.
-      let used = settled.context.used;
-      if (e.usage && settled.context.window && updateContextGauge) {
+      let used = s.context.used;
+      if (e.usage && s.context.window && updateContextGauge) {
         const hasContext =
           (e.usage.contextPromptTokens ?? 0) > 0 || (e.usage.contextCompletionTokens ?? 0) > 0;
         used = hasContext
           ? (e.usage.contextPromptTokens ?? 0) + (e.usage.contextCompletionTokens ?? 0)
           : (e.usage.promptTokens ?? 0) + (e.usage.completionTokens ?? 0);
       }
-      const turnTokens = settled.turnTokens + (e.usage?.completionTokens ?? 0);
-      const turnOutputTokens = updateContextGauge
-        ? settled.turnOutputTokens + (e.usage?.completionTokens ?? 0)
-        : settled.turnOutputTokens;
-      const turnOutputCharsAtUsage = updateContextGauge
-        ? (settled.live?.text.length ?? 0) + (settled.live?.reasoning.length ?? 0)
-        : settled.turnOutputCharsAtUsage;
-      const turnOutputEstimated = updateContextGauge
-        ? settled.turnOutputEstimated || Boolean(e.usage?.estimated)
-        : settled.turnOutputEstimated;
+      const turnTokens = s.turnTokens + (e.usage?.completionTokens ?? 0);
       const usageTokens = usageTotalTokens(e.usage);
-      const turnTotalTokens = settled.turnTotalTokens + usageTokens;
-      const sessionTokens = settled.sessionTokens + usageTokens;
+      const turnTotalTokens = s.turnTotalTokens + usageTokens;
+      const sessionTokens = s.sessionTokens + usageTokens;
       const usageCost = e.usage?.cost ?? e.usage?.costUsd ?? 0;
-      const turnCost = settled.turnCost + usageCost;
-      const sessionCost = settled.sessionCost + usageCost;
-      const sessionCurrency = e.usage?.currency || settled.sessionCurrency || "¥";
-      const usage = updateContextGauge ? e.usage : settled.usage;
+      const turnCost = s.turnCost + usageCost;
+      const sessionCost = s.sessionCost + usageCost;
+      const sessionCurrency = e.usage?.currency || s.sessionCurrency || "¥";
+      const usage = updateContextGauge ? e.usage : s.usage;
       // The completed round's usage now accounts for the streamed tool-call
       // arguments, so drop the live estimate rather than double-count it.
-      return { ...settled, usage, context: { ...settled.context, used, sessionTokens }, turnTokens, turnOutputTokens, turnOutputCharsAtUsage, turnOutputEstimated, turnTotalTokens, turnCost, turnArgChars: updateContextGauge ? 0 : settled.turnArgChars, sessionTokens, sessionCost, sessionCurrency, usageSeq: settled.usageSeq + 1 };
+      return { ...s, usage, context: { ...s.context, used, sessionTokens }, turnTokens, turnTotalTokens, turnCost, turnArgChars: 0, sessionTokens, sessionCost, sessionCurrency, usageSeq: s.usageSeq + 1 };
     }
     case "notice":
       return appendNoticeToState(s, e.level ?? "info", e.text ?? "", e.detail, e.code, e.decisionReceipt);
@@ -1712,8 +1632,8 @@ function applyEvent(s: State, e: WireEvent): State {
       return { ...s, seq: s.seq + 1, items: [...s.items, { kind: "notice", id: `g${s.seq}`, level, text: formatGuardianAssessmentNotice(e.guardian) }] };
     }
     case "turn_done": {
+      if (s.pendingUser !== undefined) s = flushPendingUser(s);
       const now = Date.now();
-      s = snapshotCompletedTurnTelemetry(s, now);
       const workDurationMs = currentTurnDurationMs(s, now);
       let lastUserIndex = -1;
       let lastAssistantIndex = -1;
@@ -1786,7 +1706,7 @@ function applyEvent(s: State, e: WireEvent): State {
       const keepPlanApproval = s.approval?.tool === "exit_plan_mode";
       let next: State = {
         ...s,
-        items: applyTurnCheckpoint(items, e.submissionId, e.checkpointTurn),
+        items,
         live: undefined,
         streamAttemptJournal: undefined,
         running: keepPlanApproval,
@@ -1812,11 +1732,10 @@ export function reducer(s: State, a: Action): State {
   switch (a.type) {
     case "user": {
       const seq = a.seq !== undefined ? a.seq : s.seq;
-      const userItemId = `u${seq}`;
       return {
         ...s,
         seq: seq + 1,
-        items: [...s.items, { kind: "user", id: userItemId, submissionId: a.submissionId, text: a.text, submitText: a.submitText, createdAt: Date.now() }],
+        items: [...s.items, { kind: "user", id: `u${seq}`, text: a.text, submitText: a.submitText, createdAt: Date.now() }],
         running: true,
         pendingPrompt: false,
         cancelRequested: false,
@@ -1827,7 +1746,6 @@ export function reducer(s: State, a: Action): State {
         promptArrivedAt: undefined,
         promptArrivedId: undefined,
         pendingUser: a.text,
-        pendingSubmissionId: a.submissionId,
         deliveryRecoveryActive: Boolean(a.deliveryRecovery),
         discardTurn: false,
       };
@@ -1836,7 +1754,6 @@ export function reducer(s: State, a: Action): State {
       const cleared = endPromptWait({
         ...s,
         pendingUser: undefined,
-        pendingSubmissionId: undefined,
         discardTurn: true,
         running: false,
         pendingPrompt: false,
@@ -1862,13 +1779,16 @@ export function reducer(s: State, a: Action): State {
         cancellable: s.running || s.turnActive,
       });
     }
-    case "send_confirmed": return confirmPendingUser(s, a.submissionId);
     case "send_failed": {
-      if (s.pendingSubmissionId !== a.submissionId) return s;
-      const idx = s.items.findIndex((it) => it.kind === "user" && it.submissionId === a.submissionId);
-      const items = idx >= 0 ? s.items.map((it, i) => (i === idx ? { ...it, submissionId: undefined, failed: true } : it)) : s.items;
+      if (s.pendingUser === undefined) return s;
+      let idx = -1;
+      for (let i = s.items.length - 1; i >= 0; i--) {
+        const it = s.items[i];
+        if (it.kind === "user" && it.text === s.pendingUser) { idx = i; break; }
+      }
+      const items = idx >= 0 ? s.items.map((it, i) => (i === idx ? { ...it, failed: true } : it)) : s.items;
       const notice: Item = { kind: "notice", id: `n${s.seq}`, level: "warn", text: a.error };
-      return { ...s, pendingUser: undefined, pendingSubmissionId: undefined, deliveryRecoveryActive: false, running: false, turnActive: false, pendingPrompt: false, cancelRequested: false, cancellable: false, live: undefined, seq: s.seq + 1, items: [...items, notice] };
+      return { ...s, pendingUser: undefined, deliveryRecoveryActive: false, running: false, turnActive: false, pendingPrompt: false, cancelRequested: false, cancellable: false, live: undefined, seq: s.seq + 1, items: [...items, notice] };
     }
     case "backend_status": {
       // A snapshot fetched before the live approval/ask event arrived cannot
@@ -1906,15 +1826,14 @@ export function reducer(s: State, a: Action): State {
           turnStartAt: s.turnStartAt || Date.now(),
         };
       }
-      const telemetry = snapshotCompletedTurnTelemetry(s);
-      const finalized = telemetry.items.map((it) => {
-        if (it.kind === "assistant" && telemetry.live && it.id === telemetry.live.id) return { ...it, text: telemetry.live.text, reasoning: telemetry.live.reasoning, streaming: false };
+      const finalized = s.items.map((it) => {
+        if (it.kind === "assistant" && s.live && it.id === s.live.id) return { ...it, text: s.live.text, reasoning: s.live.reasoning, streaming: false };
         if (it.kind === "assistant" && it.streaming) return { ...it, streaming: false };
         if (it.kind === "tool" && it.status === "running") return { ...it, status: "stopped" as const };
         return it;
       });
       return endPromptWait({
-        ...telemetry,
+        ...s,
         items: finalized,
         running: false,
         turnActive: false,
@@ -1994,7 +1913,7 @@ export function reducer(s: State, a: Action): State {
     case "message_action_done": return { ...s, messageAction: undefined };
     case "history": {
       const { items, seq } = historyMessagesToItems(a.messages, "h", s.seq);
-      return { ...s, items: compactArchivedToolItems(items), pendingSubmissionId: undefined, seq, hydrateHistoryLoaded: true, hydratePlaceholderItems: undefined, historyStartTurn: 0, historyTotalTurns: 0, historyHasOlder: false, historyOlderLoading: false };
+      return { ...s, items: compactArchivedToolItems(items), seq, hydrateHistoryLoaded: true, hydratePlaceholderItems: undefined, historyStartTurn: 0, historyTotalTurns: 0, historyHasOlder: false, historyOlderLoading: false, historyRevision: undefined, historyDigest: undefined };
     }
     case "history_page": {
       const { items, seq } = historyPageItems(a.page);
@@ -2002,7 +1921,6 @@ export function reducer(s: State, a: Action): State {
       return {
         ...s,
         items: compactArchivedToolItems(nextItems),
-        pendingSubmissionId: a.mode === "replace" ? undefined : s.pendingSubmissionId,
         seq: Math.max(s.seq, seq),
         hydrateHistoryLoaded: true,
         hydratePlaceholderItems: undefined,
@@ -2010,10 +1928,14 @@ export function reducer(s: State, a: Action): State {
         historyTotalTurns: a.page.totalTurns,
         historyHasOlder: a.page.hasOlder,
         historyOlderLoading: false,
+        historyRevision: a.page.revision,
+        historyDigest: a.page.digest,
       };
     }
     case "history_older_start": return s.historyOlderLoading ? s : { ...s, historyOlderLoading: true };
     case "history_older_error": return s.historyOlderLoading ? { ...s, historyOlderLoading: false } : s;
+    case "history_checkpoint_turns":
+      return { ...s, items: mergeHistoryCheckpointTurns(s.items, a.turns, s.historyStartTurn) };
     case "local_notice": return { ...s, running: false, turnActive: false, seq: s.seq + 1, items: [...s.items, { kind: "notice", id: `n${s.seq}`, level: a.level, text: a.text }] };
     case "clearApproval": {
       const next = { ...s, approval: undefined, pendingPrompt: Boolean(s.ask), resolvedPromptId: s.approval?.id ?? s.resolvedPromptId };
@@ -2059,9 +1981,7 @@ export function reducer(s: State, a: Action): State {
       // the id-anchored bookkeeping.
       return {
         ...s,
-        items: s.items.map((item) => item.kind === "user" && item.submissionId ? { ...item, submissionId: undefined } : item),
         promptEpoch: s.promptEpoch + 1,
-        pendingSubmissionId: undefined,
         resolvedPromptId: undefined,
         promptArrivedId: undefined,
         promptArrivedAt: undefined,
@@ -2245,6 +2165,7 @@ export function localizedBackendNoticeText(text: string): string {
   }
   if (
     /^repeated save conflicts were detected; saved the current conflict copy in place$/i.test(msg) ||
+    /^repeated save conflicts were detected; saved the current conflict copy in an isolated recovery branch$/i.test(msg) ||
     /^session conflicts kept recurring; kept the transcript on the current recovery branch$/i.test(msg)
   ) {
     return t("recovery.noticeKeptCurrent");
@@ -2333,6 +2254,7 @@ function recoveryNoticeDedupeKey(text: string, code?: string): string {
   }
   if (
     /^repeated save conflicts were detected; saved the current conflict copy in place$/i.test(msg) ||
+    /^repeated save conflicts were detected; saved the current conflict copy in an isolated recovery branch$/i.test(msg) ||
     /^session conflicts kept recurring; kept the transcript on the current recovery branch$/i.test(msg) ||
     msg === t("recovery.noticeKeptCurrent")
   ) {
@@ -2519,9 +2441,6 @@ export function useController() {
     getSnapshot(tabId) {
       return tabId ? statesRef.current.get(tabId)?.live : undefined;
     },
-    getModelActiveAt(tabId) {
-      return tabId ? statesRef.current.get(tabId)?.turnModelActiveAt : undefined;
-    },
   }), []);
   const beginActiveNavigation = useCallback(() => {
     activeNavigationSeqRef.current += 1;
@@ -2563,10 +2482,6 @@ export function useController() {
         prev.currentAssistant === next.currentAssistant &&
         prev.pendingUser === next.pendingUser &&
         prev.retry === next.retry;
-      // Text/reasoning-only deltas only update the live stream — which the
-      // frontend reads through its own subscription — so they must not bump the
-      // full controller tree (the run-strip TPS estimate subscribes to the live
-      // stream directly and updates itself).
       if (!streamDeltaOnly) bump();
     }
   }, [bump, notifyLiveListeners]);
@@ -2658,8 +2573,7 @@ export function useController() {
   const checkpointRefreshSeq = useRef(new Map<string, number>());
   const metaRefreshSeq = useRef(new Map<string, number>());
   const sessionLoadSeq = useRef(new Map<string, number>());
-  const cancelHydrateSeq = useRef(new Map<string, number>());
-  const sessionLoadInFlight = useRef(new Map<string, { sessionPath: string; promise: Promise<void> }>());
+  const sessionLoadInFlight = useRef(new Map<string, { sessionPath: string; revision?: number; digest?: string; promise: Promise<void> }>());
   const bumpMetaRefreshSeq = useCallback((tabId: string): number => {
     const seq = (metaRefreshSeq.current.get(tabId) ?? 0) + 1;
     metaRefreshSeq.current.set(tabId, seq);
@@ -2679,14 +2593,6 @@ export function useController() {
   }, [bumpMetaRefreshSeq]);
   const sessionLoadCurrent = useCallback((tabId: string, seq: number): boolean => {
     return sessionLoadSeq.current.get(tabId) === seq;
-  }, []);
-  const bumpCancelHydrateSeq = useCallback((tabId: string): number => {
-    const seq = (cancelHydrateSeq.current.get(tabId) ?? 0) + 1;
-    cancelHydrateSeq.current.set(tabId, seq);
-    return seq;
-  }, []);
-  const cancelHydrateCurrent = useCallback((tabId: string, seq: number): boolean => {
-    return cancelHydrateSeq.current.get(tabId) === seq;
   }, []);
   const loadMetaForTab = useCallback(async (tabId: string): Promise<Meta | undefined> => {
     const seq = bumpMetaRefreshSeq(tabId);
@@ -2728,42 +2634,33 @@ export function useController() {
     tabId: string,
     reset = false,
     reason: HydrateReason = "startup",
-    options: {
-      skipHistory?: boolean;
-      placeholderItems?: Item[];
-      preserveCachedHistory?: boolean;
-      sessionPath?: string;
-      cancelHydrateGeneration?: number;
-      deferResetUntilHistory?: boolean;
-    } = {},
+    options: { skipHistory?: boolean; placeholderItems?: Item[]; preserveCachedHistory?: boolean; sessionPath?: string; sessionRevision?: number; sessionDigest?: string } = {},
   ) => {
-    const sessionPath = (options.sessionPath ?? statesRef.current.get(tabId)?.meta?.sessionPath ?? "").trim();
+    const stateMeta = statesRef.current.get(tabId)?.meta;
+    const sessionPath = (options.sessionPath ?? stateMeta?.sessionPath ?? "").trim();
+    const sessionRevision = options.sessionRevision ?? stateMeta?.sessionRevision;
+    const sessionDigest = options.sessionDigest ?? stateMeta?.sessionDigest;
     const canJoinInFlight = !reset && !options.skipHistory;
     const shouldTrackInFlight = !options.skipHistory;
     if (canJoinInFlight) {
       const existing = sessionLoadInFlight.current.get(tabId);
-      if (existing?.sessionPath === sessionPath) return existing.promise;
+      if (existing?.sessionPath === sessionPath && existing.revision === sessionRevision && existing.digest === sessionDigest) return existing.promise;
     } else {
       sessionLoadInFlight.current.delete(tabId);
     }
 
     const promise = (async () => {
-      const cancelHydrateGeneration = options.cancelHydrateGeneration;
-      if (cancelHydrateGeneration !== undefined && !cancelHydrateCurrent(tabId, cancelHydrateGeneration)) return;
       const seq = bumpSessionLoadSeq(tabId);
       const hydrateStartedAt = Date.now();
       const skipHistory = Boolean(
         options.skipHistory ||
-        (options.preserveCachedHistory && !reset && hasReusableCachedTranscript(statesRef.current.get(tabId), options.sessionPath)),
+        (options.preserveCachedHistory && !reset && hasReusableCachedTranscript(statesRef.current.get(tabId), sessionPath, sessionRevision, sessionDigest)),
       );
-      const deferResetUntilHistory = Boolean(options.deferResetUntilHistory && reset && !skipHistory);
-      const stillCurrent = () =>
-        sessionLoadCurrent(tabId, seq) &&
-        (cancelHydrateGeneration === undefined || cancelHydrateCurrent(tabId, cancelHydrateGeneration));
-      if (!stillCurrent()) return;
       addBreadcrumb("tab.hydrate", `start ${reason} ${tabId}`);
       dispatchTo(tabId, { type: "hydrate_start", reason, placeholderItems: options.placeholderItems });
-      if (reset && !deferResetUntilHistory && stillCurrent()) dispatchTo(tabId, { type: "reset" });
+      if (reset && sessionLoadCurrent(tabId, seq)) dispatchTo(tabId, { type: "reset" });
+
+      const stillCurrent = () => sessionLoadCurrent(tabId, seq);
       const requiresVisibleTab = reason === "startup" || reason === "switch-tab" || reason === "open-topic";
       const stillVisible = () => !requiresVisibleTab || activeTabIdRef.current === tabId;
       const noteFailure = (label: string, err: unknown) => {
@@ -2791,7 +2688,6 @@ export function useController() {
       if (!stillCurrent()) return;
       if (!skipHistory && historyPage !== undefined) {
         const messages = asArray(historyPage.messages);
-        if (deferResetUntilHistory && stillCurrent()) dispatchTo(tabId, { type: "reset" });
         dispatchTo(tabId, { type: "history_page", page: historyPage, mode: "replace" });
         addBreadcrumb(
           "tab.hydrate",
@@ -2811,7 +2707,6 @@ export function useController() {
         }
       }
 
-      if (!stillCurrent()) return;
       dispatchTo(tabId, { type: "hydrate_done" });
       addBreadcrumb("tab.hydrate", `done ${reason} ${tabId} ms=${Date.now() - hydrateStartedAt}`);
 
@@ -2825,13 +2720,39 @@ export function useController() {
         addBreadcrumb("tab.hydrate", `ancillary skipped inactive ${reason} ${tabId}`);
         return;
       }
-      const meta = await loadTimed("meta", () => loadMetaForTab(tabId));
+      let meta = await loadTimed("meta", () => loadMetaForTab(tabId));
       if (!stillCurrent()) return;
       if (!stillVisible()) {
         addBreadcrumb("tab.hydrate", `meta ignored inactive ${reason} ${tabId}`);
         return;
       }
       if (meta !== undefined) dispatchTo(tabId, { type: "meta", meta });
+      const foregroundTurnActive = (): boolean => {
+        const state = statesRef.current.get(tabId);
+        return Boolean(state?.running || state?.turnActive || state?.pendingPrompt);
+      };
+      if (meta !== undefined && historyPage !== undefined && !skipHistory &&
+        !foregroundTurnActive() && !historyPageMatchesMeta(historyPage, meta)) {
+        // The transcript and metadata are persisted in separate files. A save
+        // can advance between those reads, so an exact-content page may be
+        // older than the metadata sampled just afterwards. Re-read both as a
+        // bounded pair; only replace the visible history when their canonical
+        // fingerprints agree. A continuously changing session keeps the first
+        // exact page and remains non-reusable because its digest differs.
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+          const reconciledPage = await loadTimed("history reconcile", () => app.HistoryPageForTab(tabId, 0, HISTORY_PAGE_TURNS));
+          if (!stillCurrent() || !stillVisible() || reconciledPage === undefined) return;
+          const reconciledMeta = await loadTimed("meta reconcile", () => loadMetaForTab(tabId));
+          if (!stillCurrent() || !stillVisible() || reconciledMeta === undefined) return;
+          meta = reconciledMeta;
+          dispatchTo(tabId, { type: "meta", meta });
+          if (!foregroundTurnActive() && historyPageMatchesMeta(reconciledPage, meta)) {
+            dispatchTo(tabId, { type: "history_page", page: reconciledPage, mode: "replace" });
+            break;
+          }
+          if (foregroundTurnActive()) break;
+        }
+      }
       const ancillaryStartedAt = Date.now();
       const loadAncillary = async <T,>(label: string, load: () => Promise<T>): Promise<T | undefined> => {
         return loadTimed(`ancillary ${label}`, load);
@@ -2869,7 +2790,7 @@ export function useController() {
       });
     })();
     if (shouldTrackInFlight) {
-      sessionLoadInFlight.current.set(tabId, { sessionPath, promise });
+      sessionLoadInFlight.current.set(tabId, { sessionPath, revision: sessionRevision, digest: sessionDigest, promise });
     }
     try {
       await promise;
@@ -2878,7 +2799,7 @@ export function useController() {
         sessionLoadInFlight.current.delete(tabId);
       }
     }
-  }, [bumpSessionLoadSeq, cancelHydrateCurrent, dispatchTo, loadMetaForTab, refreshBalanceForTab, sessionLoadCurrent]);
+  }, [bumpSessionLoadSeq, dispatchTo, loadMetaForTab, refreshBalanceForTab, sessionLoadCurrent]);
 
   const loadOlderHistory = useCallback(async (tabId?: string): Promise<void> => {
     const targetTabId = tabId || activeTabIdRef.current;
@@ -2887,12 +2808,22 @@ export function useController() {
     if (!state?.historyHasOlder || state.historyOlderLoading || state.running) return;
     const beforeTurn = state.historyStartTurn;
     const sessionPath = state.meta?.sessionPath ?? "";
+    const sessionRevision = state.meta?.sessionRevision ?? state.historyRevision;
+    const sessionDigest = state.meta?.sessionDigest ?? state.historyDigest;
     dispatchTo(targetTabId, { type: "history_older_start" });
     const startedAt = Date.now();
     try {
       const page = await app.HistoryPageForTab(targetTabId, beforeTurn, HISTORY_PAGE_TURNS);
       const current = statesRef.current.get(targetTabId);
-      if (!current || current.historyStartTurn !== beforeTurn || (current.meta?.sessionPath ?? "") !== sessionPath) {
+      const currentRevision = current?.meta?.sessionRevision ?? current?.historyRevision;
+      const currentDigest = current?.meta?.sessionDigest ?? current?.historyDigest;
+      const fingerprintMatches = (expected: number | undefined, actual: number | undefined) =>
+        expected === undefined || expected <= 0 ? true : actual === expected;
+      const digestMatches = (expected: string | undefined, actual: string | undefined) =>
+        !expected || actual === expected;
+      if (!current || current.historyStartTurn !== beforeTurn || (current.meta?.sessionPath ?? "") !== sessionPath ||
+        !fingerprintMatches(sessionRevision, currentRevision) || !digestMatches(sessionDigest, currentDigest) ||
+        !fingerprintMatches(sessionRevision, page.revision) || !digestMatches(sessionDigest, page.digest)) {
         dispatchTo(targetTabId, { type: "history_older_error" });
         return;
       }
@@ -2979,6 +2910,8 @@ export function useController() {
     await loadSessionDataForTab(active.id, reset, "startup", {
       preserveCachedHistory,
       sessionPath: active.sessionPath,
+      sessionRevision: active.sessionRevision,
+      sessionDigest: active.sessionDigest,
     });
     if (reset) dispatchRuntimeStatusForTab(active.id, active, snapshotAt);
     return active.id;
@@ -2999,7 +2932,11 @@ export function useController() {
     const foregroundRunning = dispatchRuntimeStatusForTab(tabId, tab, snapshotAt);
     const missedTurnDone = Boolean(local?.running && !foregroundRunning);
     if (hydrateSessionData && (needsInitialLoad || missedTurnDone)) {
-      await loadSessionDataForTab(tabId, missedTurnDone, "startup");
+      await loadSessionDataForTab(tabId, missedTurnDone, "startup", {
+        sessionPath: tab.sessionPath,
+        sessionRevision: tab.sessionRevision,
+        sessionDigest: tab.sessionDigest,
+      });
       return tabs;
     }
     const [jobs, effort] = await Promise.all([
@@ -3035,7 +2972,7 @@ export function useController() {
     cancelReconcileTimers.current.delete(tabId);
   }, []);
 
-  const scheduleCancelReconcile = useCallback((tabId: string, attempt = 0, cancelHydrateGeneration?: number) => {
+  const scheduleCancelReconcile = useCallback((tabId: string, attempt = 0) => {
     clearCancelReconcileTimer(tabId);
     const delay = CANCEL_RECONCILE_DELAYS_MS[Math.min(attempt, CANCEL_RECONCILE_DELAYS_MS.length - 1)];
     const timer = window.setTimeout(() => {
@@ -3045,24 +2982,12 @@ export function useController() {
         if (!tab) return;
         const stillReconciling = foregroundRunningFromRuntimeMeta(tab) || Boolean(tab.cancelRequested);
         if (stillReconciling && attempt + 1 < CANCEL_RECONCILE_DELAYS_MS.length) {
-          scheduleCancelReconcile(tabId, attempt + 1, cancelHydrateGeneration);
-          return;
-        }
-        // Cancel can race the optimistic user bubble before turn_started. The
-        // backend still persists that visible prompt (and its checkpoint), so
-        // hydrate the authoritative transcript once teardown is idle instead
-        // of leaving the UI with a discarded bubble and no edit/rewind target.
-        if (!stillReconciling) {
-          void loadSessionDataForTab(tabId, true, "rewind", {
-            cancelHydrateGeneration,
-            deferResetUntilHistory: true,
-          }).catch(() => {});
-          void refreshCheckpoints(tabId);
+          scheduleCancelReconcile(tabId, attempt + 1);
         }
       }).catch(() => {});
     }, delay);
     cancelReconcileTimers.current.set(tabId, timer);
-  }, [clearCancelReconcileTimer, loadSessionDataForTab, reconcileTabRuntime, refreshCheckpoints]);
+  }, [clearCancelReconcileTimer, reconcileTabRuntime]);
 
   useEffect(() => {
     const textBatch = createRafBatch<StreamDeltaEntry>((batch) => {
@@ -3084,13 +3009,17 @@ export function useController() {
       uiPerfTracker.onWireEvent(targetTabId, e.kind);
       if (TURN_ACTIVITY_KINDS.has(e.kind)) lastTurnActivityAtByTab.current.set(targetTabId, Date.now());
       if (e.kind === "text" || e.kind === "reasoning") {
-        if (e.submissionId) dispatchTo(targetTabId, { type: "send_confirmed", submissionId: e.submissionId });
         textBatch.push({ tabId: targetTabId, e });
       } else {
         textBatch.drain();
         dispatchTo(targetTabId, { type: "event", e });
       }
       if (e.kind === "turn_done") {
+        if (!e.err) {
+          app.HistoryCheckpointTurnsForTab(targetTabId)
+            .then((turns) => dispatchTo(targetTabId, { type: "history_checkpoint_turns", turns: asArray(turns) }))
+            .catch(() => {});
+        }
         app
           .ContextUsageForTab(targetTabId)
           .then((context) => dispatchTo(targetTabId, { type: "context", context }))
@@ -3275,17 +3204,14 @@ export function useController() {
       throw new Error(runtime?.issue?.message || currentState.meta.startupErr || t("composer.workspaceStarting"));
     }
     const seq = currentState.seq;
-    const submissionId = createTurnSubmissionId(tabId, currentState.sessionGen, seq, runtimeEpochByTabRef.current.get(tabId) ?? runtime?.epoch);
     const promptEpoch = currentState.promptEpoch;
     const { display, submit } = normalizeTurnSubmit(displayText, submitText);
     const original = originalText?.trim() ?? "";
-    bumpCancelHydrateSeq(tabId);
-    if (currentState.hydrateReason === "rewind") dispatchTo(tabId, { type: "hydrate_done" });
-    dispatchTo(tabId, { type: "user", text: displayText, submitText: display !== submit ? submit : undefined, seq, submissionId });
+    dispatchTo(tabId, { type: "user", text: displayText, submitText: display !== submit ? submit : undefined, seq });
     invalidateCache();
     try {
       const submitPromise = initialGoal
-        ? app.SubmitInitialGoalToTabWithID(
+        ? app.SubmitInitialGoalToTab(
             tabId,
             initialGoal.goal,
             structured?.display.trim() || display,
@@ -3293,29 +3219,26 @@ export function useController() {
             structured?.invocations ?? [],
             initialGoal.collaborationMode,
             initialGoal.toolApprovalMode,
-            submissionId,
           )
         : structured
-        ? app.SubmitInvocationsToTabWithID(tabId, structured.display.trim(), structured.input.trim(), structured.invocations, submissionId)
+        ? app.SubmitInvocationsToTab(tabId, structured.display.trim(), structured.input.trim(), structured.invocations)
         : original
-        ? app.SubmitEditedDisplayToTabWithID(tabId, display, submit, original, submissionId)
-        : display !== submit ? app.SubmitDisplayToTabWithID(tabId, display, submit, submissionId) : app.SubmitToTabWithID(tabId, submit, submissionId);
+        ? app.SubmitEditedDisplayToTab(tabId, display, submit, original)
+        : display !== submit ? app.SubmitDisplayToTab(tabId, display, submit) : app.SubmitToTab(tabId, submit);
       if (initialGoal) {
         const drained = await submitPromise;
-        dispatchTo(tabId, { type: "send_confirmed", submissionId });
         const ids = Array.isArray(drained) ? drained : [];
         if (ids.length) dispatchTo(tabId, { type: "approval_drained", ids, epoch: promptEpoch });
         return;
       }
-      void submitPromise.then(
-        () => dispatchTo(tabId, { type: "send_confirmed", submissionId }),
-        (error) => dispatchTo(tabId, { type: "send_failed", submissionId, error: `Send failed: ${error instanceof Error ? error.message : String(error)}` }),
-      );
+      void submitPromise.catch((error) => {
+        dispatchTo(tabId, { type: "send_failed", error: `Send failed: ${error instanceof Error ? error.message : String(error)}` });
+      });
     } catch (error) {
-      dispatchTo(tabId, { type: "send_failed", submissionId, error: `Send failed: ${error instanceof Error ? error.message : String(error)}` });
+      dispatchTo(tabId, { type: "send_failed", error: `Send failed: ${error instanceof Error ? error.message : String(error)}` });
       throw error;
     }
-  }, [bumpCancelHydrateSeq, dispatchTo]);
+  }, [dispatchTo]);
 
   const recoverDeliveryToTab = useCallback(async (tabId: string, displayText: string, submitText = displayText) => {
     if (!tabId) throw new Error(t("composer.workspaceStarting"));
@@ -3325,18 +3248,16 @@ export function useController() {
       throw new Error(runtime?.issue?.message || currentState.meta.startupErr || t("composer.workspaceStarting"));
     }
     const seq = currentState.seq;
-    const submissionId = createTurnSubmissionId(tabId, currentState.sessionGen, seq, runtimeEpochByTabRef.current.get(tabId) ?? runtime?.epoch);
     const display = displayText.trim();
     const submit = submitText.trim();
-    dispatchTo(tabId, { type: "user", text: displayText, submitText: display !== submit ? submit : undefined, seq, submissionId, deliveryRecovery: true });
+    dispatchTo(tabId, { type: "user", text: displayText, submitText: display !== submit ? submit : undefined, seq, deliveryRecovery: true });
     invalidateCache();
     try {
-      void app.SubmitDeliveryRecoveryToTabWithID(tabId, display, submit, submissionId).then(
-        () => dispatchTo(tabId, { type: "send_confirmed", submissionId }),
-        (error) => dispatchTo(tabId, { type: "send_failed", submissionId, error: `Send failed: ${error instanceof Error ? error.message : String(error)}` }),
-      );
+      void app.SubmitDeliveryRecoveryToTab(tabId, display, submit).catch((error) => {
+        dispatchTo(tabId, { type: "send_failed", error: `Send failed: ${error instanceof Error ? error.message : String(error)}` });
+      });
     } catch (error) {
-      dispatchTo(tabId, { type: "send_failed", submissionId, error: `Send failed: ${error instanceof Error ? error.message : String(error)}` });
+      dispatchTo(tabId, { type: "send_failed", error: `Send failed: ${error instanceof Error ? error.message : String(error)}` });
       throw error;
     }
   }, [dispatchTo]);
@@ -3359,14 +3280,11 @@ export function useController() {
 
   const runShellForTab = useCallback(async (tabId: string, command: string) => {
     if (!tabId) throw new Error(t("composer.workspaceStarting"));
-    const currentState = getOrCreateState(statesRef.current, tabId);
-    const submissionId = createTurnSubmissionId(tabId, currentState.sessionGen, currentState.seq, runtimeEpochByTabRef.current.get(tabId) ?? currentState.meta?.runtime?.epoch);
-    dispatchTo(tabId, { type: "user", text: `!${command}`, seq: currentState.seq, submissionId });
+    dispatchTo(tabId, { type: "user", text: `!${command}`, seq: getOrCreateState(statesRef.current, tabId).seq });
     try {
       await app.RunShellForTab(tabId, command);
-      dispatchTo(tabId, { type: "send_confirmed", submissionId });
     } catch (error) {
-      dispatchTo(tabId, { type: "send_failed", submissionId, error: `Command failed: ${error instanceof Error ? error.message : String(error)}` });
+      dispatchTo(tabId, { type: "send_failed", error: `Command failed: ${error instanceof Error ? error.message : String(error)}` });
       throw error;
     }
   }, [dispatchTo]);
@@ -3411,13 +3329,12 @@ export function useController() {
   }, [activeTabId, dispatchTo]);
 
   const cancelTab = useCallback((tabId: string) => {
-    const cancelHydrateGeneration = bumpCancelHydrateSeq(tabId);
     app.CancelTab(tabId)
-      .then(() => scheduleCancelReconcile(tabId, 0, cancelHydrateGeneration))
+      .then(() => scheduleCancelReconcile(tabId))
       .catch((error) => {
         dispatchTo(tabId, { type: "local_notice", level: "warn", text: `Cancel failed: ${errorMessage(error)}` });
       });
-  }, [bumpCancelHydrateSeq, dispatchTo, scheduleCancelReconcile]);
+  }, [dispatchTo, scheduleCancelReconcile]);
 
   const cancel = useCallback((): string | undefined => {
     const cur = stateRef.current;
@@ -4052,7 +3969,9 @@ export function useController() {
     const startedAt = Date.now();
     const previousTabId = activeTabIdRef.current;
     const targetSessionPath = optimisticTab?.sessionPath ?? statesRef.current.get(tabId)?.meta?.sessionPath;
-    const preserveCachedHistory = hasReusableCachedTranscript(statesRef.current.get(tabId), targetSessionPath);
+    const targetSessionRevision = optimisticTab?.sessionRevision ?? statesRef.current.get(tabId)?.meta?.sessionRevision;
+    const targetSessionDigest = optimisticTab?.sessionDigest ?? statesRef.current.get(tabId)?.meta?.sessionDigest;
+    const preserveCachedHistory = hasReusableCachedTranscript(statesRef.current.get(tabId), targetSessionPath, targetSessionRevision, targetSessionDigest);
     addBreadcrumb("tab.switch", `click ${tabId}`);
     setActiveTabId(tabId);
     activeTabIdRef.current = tabId;
@@ -4098,6 +4017,8 @@ export function useController() {
           skipHistory: hasCachedLiveTurn(statesRef.current.get(tabId)),
           preserveCachedHistory,
           sessionPath: targetSessionPath,
+          sessionRevision: targetSessionRevision,
+          sessionDigest: targetSessionDigest,
         });
         return tabs;
       })
@@ -4121,7 +4042,7 @@ export function useController() {
     const prevItems = activeTabIdRef.current ? statesRef.current.get(activeTabIdRef.current)?.items : undefined;
     const prevState = statesRef.current.get(meta.id);
     const isNewTab = !prevState;
-    const preserveCachedHistory = hasReusableCachedTranscript(prevState, meta.sessionPath);
+    const preserveCachedHistory = hasReusableCachedTranscript(prevState, meta.sessionPath, meta.sessionRevision, meta.sessionDigest);
     setActiveTabId(meta.id);
     activeTabIdRef.current = meta.id;
     confirmBackendActiveTab(meta.id);
@@ -4131,6 +4052,8 @@ export function useController() {
       placeholderItems: isNewTab ? prevItems : undefined,
       preserveCachedHistory,
       sessionPath: meta.sessionPath,
+      sessionRevision: meta.sessionRevision,
+      sessionDigest: meta.sessionDigest,
     });
     if (isNewTab) void load.then(() => reconcileTabRuntime(meta.id, { hydrateSessionData: false })).catch(() => {});
     else void load;
@@ -4148,7 +4071,7 @@ export function useController() {
     const prevItems = activeTabIdRef.current ? statesRef.current.get(activeTabIdRef.current)?.items : undefined;
     const prevState = statesRef.current.get(meta.id);
     const isNewTab = !prevState;
-    const preserveCachedHistory = hasReusableCachedTranscript(prevState, meta.sessionPath);
+    const preserveCachedHistory = hasReusableCachedTranscript(prevState, meta.sessionPath, meta.sessionRevision, meta.sessionDigest);
     setActiveTabId(meta.id);
     activeTabIdRef.current = meta.id;
     confirmBackendActiveTab(meta.id);
@@ -4158,6 +4081,8 @@ export function useController() {
       placeholderItems: isNewTab ? prevItems : undefined,
       preserveCachedHistory,
       sessionPath: meta.sessionPath,
+      sessionRevision: meta.sessionRevision,
+      sessionDigest: meta.sessionDigest,
     });
     if (isNewTab) void load.then(() => reconcileTabRuntime(meta.id, { hydrateSessionData: false })).catch(() => {});
     else void load;
@@ -4175,7 +4100,7 @@ export function useController() {
     const prevItems = activeTabIdRef.current ? statesRef.current.get(activeTabIdRef.current)?.items : undefined;
     const prevState = statesRef.current.get(meta.id);
     const isNewTab = !prevState;
-    const preserveCachedHistory = hasReusableCachedTranscript(prevState, meta.sessionPath);
+    const preserveCachedHistory = hasReusableCachedTranscript(prevState, meta.sessionPath, meta.sessionRevision, meta.sessionDigest);
     setActiveTabId(meta.id);
     activeTabIdRef.current = meta.id;
     confirmBackendActiveTab(meta.id);
@@ -4185,6 +4110,8 @@ export function useController() {
       placeholderItems: isNewTab ? prevItems : undefined,
       preserveCachedHistory,
       sessionPath: meta.sessionPath,
+      sessionRevision: meta.sessionRevision,
+      sessionDigest: meta.sessionDigest,
     });
     if (isNewTab) void load.then(() => reconcileTabRuntime(meta.id, { hydrateSessionData: false })).catch(() => {});
     else void load;
