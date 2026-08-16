@@ -143,6 +143,16 @@ for (const [name, text] of Object.entries(fixtures)) {
   }
 }
 
+// Authority-form UNC links use the same strict local-file allowlist in the
+// worker pipeline as canonical file:/// links do.
+{
+  const unc = "file://nas/share/report.md";
+  eq(markdownUrlTransform(unc), unc, "authority-form UNC survives pipeline URL sanitization");
+  const root = parseMarkdownToHast(`[report](${unc})`);
+  const html = renderBlocks([{ key: "unc", children: root.children }]);
+  ok(html.includes(`href="${unc}"`), "authority-form UNC href survives HAST rendering");
+}
+
 // Content revision + byte weight.
 {
   eq(markdownContentRevision("alpha") === markdownContentRevision("alpha"), true, "content revision is deterministic");
