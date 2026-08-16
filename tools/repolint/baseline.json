@@ -2,14 +2,14 @@
   "limits": {
     "banner": 15,
     "commented-code": 0,
-    "complexity": 2074,
+    "complexity": 2096,
     "essay": 4082,
-    "file-size": 109610,
-    "function-size": 8937,
+    "file-size": 110104,
+    "function-size": 9159,
     "layering": 1,
     "marker": 0,
     "narrative": 64,
-    "test-file-size": 69713
+    "test-file-size": 69905
   },
   "files": {
     "cmd/e2ebench/main.go": {
@@ -28,15 +28,15 @@
     "desktop/app.go": {
       "complexity": 63,
       "essay": 96,
-      "file-size": 11487,
-      "function-size": 383
+      "file-size": 11489,
+      "function-size": 381
     },
     "desktop/app_autosave_test.go": {
       "essay": 1
     },
     "desktop/app_test.go": {
       "essay": 2,
-      "test-file-size": 10217
+      "test-file-size": 10227
     },
     "desktop/bot_bridge.go": {
       "essay": 11
@@ -84,7 +84,7 @@
       "essay": 2
     },
     "desktop/frontend/src/App.tsx": {
-      "file-size": 4712
+      "file-size": 4733
     },
     "desktop/frontend/src/__tests__/app-chrome-tabs.test.ts": {
       "test-file-size": 19
@@ -132,7 +132,7 @@
       "file-size": 91
     },
     "desktop/frontend/src/components/ProjectTree.tsx": {
-      "file-size": 1445
+      "file-size": 1587
     },
     "desktop/frontend/src/components/RichComposerInput.tsx": {
       "file-size": 141
@@ -162,7 +162,7 @@
       "file-size": 415
     },
     "desktop/frontend/src/lib/bridge.ts": {
-      "file-size": 4752
+      "file-size": 4750
     },
     "desktop/frontend/src/lib/crash.ts": {
       "file-size": 225
@@ -171,7 +171,7 @@
       "file-size": 307
     },
     "desktop/frontend/src/lib/types.ts": {
-      "file-size": 1453
+      "file-size": 1457
     },
     "desktop/frontend/src/lib/useController.ts": {
       "file-size": 3929
@@ -284,7 +284,7 @@
     "desktop/settings_app.go": {
       "complexity": 22,
       "essay": 26,
-      "file-size": 2797
+      "file-size": 2801
     },
     "desktop/settings_app_test.go": {
       "test-file-size": 1857
@@ -306,10 +306,10 @@
       "essay": 1
     },
     "desktop/tabs.go": {
-      "complexity": 52,
-      "essay": 131,
-      "file-size": 8177,
-      "function-size": 409
+      "complexity": 74,
+      "essay": 133,
+      "file-size": 8716,
+      "function-size": 630
     },
     "desktop/tabs_order_test.go": {
       "test-file-size": 395
@@ -319,7 +319,7 @@
     },
     "desktop/tabs_topic_test.go": {
       "essay": 1,
-      "test-file-size": 3227
+      "test-file-size": 3409
     },
     "desktop/temphelper_test.go": {
       "essay": 4
@@ -436,10 +436,10 @@
       "essay": 7
     },
     "internal/agent/agent.go": {
-      "complexity": 61,
-      "essay": 107,
-      "file-size": 2711,
-      "function-size": 125
+      "complexity": 37,
+      "essay": 104,
+      "file-size": 2478,
+      "function-size": 103
     },
     "internal/agent/ask.go": {
       "essay": 4
@@ -508,6 +508,10 @@
       "essay": 4,
       "narrative": 1,
       "test-file-size": 1020
+    },
+    "internal/agent/final_readiness.go": {
+      "complexity": 24,
+      "function-size": 24
     },
     "internal/agent/fleet.go": {
       "essay": 3,
@@ -579,8 +583,8 @@
     },
     "internal/agent/save.go": {
       "complexity": 49,
-      "essay": 112,
-      "file-size": 1536,
+      "essay": 113,
+      "file-size": 1544,
       "function-size": 124
     },
     "internal/agent/save_test.go": {
@@ -672,8 +676,8 @@
     "internal/boot/boot.go": {
       "complexity": 295,
       "essay": 102,
-      "file-size": 2229,
-      "function-size": 1855,
+      "file-size": 2226,
+      "function-size": 1854,
       "narrative": 3
     },
     "internal/boot/boot_test.go": {
@@ -821,8 +825,8 @@
     "internal/cli/cli.go": {
       "complexity": 72,
       "essay": 60,
-      "file-size": 1942,
-      "function-size": 497
+      "file-size": 1943,
+      "function-size": 498
     },
     "internal/cli/cli_test.go": {
       "essay": 9,
@@ -926,7 +930,7 @@
       "file-size": 126
     },
     "internal/cli/shell_completion.go": {
-      "function-size": 112
+      "function-size": 117
     },
     "internal/cli/skill_hooks.go": {
       "essay": 1
@@ -1069,8 +1073,8 @@
     "internal/control/controller.go": {
       "complexity": 10,
       "essay": 162,
-      "file-size": 5428,
-      "function-size": 79,
+      "file-size": 5420,
+      "function-size": 75,
       "narrative": 4
     },
     "internal/control/controller_test.go": {
@@ -1509,7 +1513,7 @@
     "internal/pluginpkg/pluginpkg.go": {
       "complexity": 1,
       "essay": 2,
-      "file-size": 407
+      "file-size": 426
     },
     "internal/pluginpkg/pluginpkg_test.go": {
       "test-file-size": 67
