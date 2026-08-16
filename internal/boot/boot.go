@@ -1994,7 +1994,14 @@ func build(ctx context.Context, opts Options) (*BuildResult, error) {
 			ctrl.ApplyExtensionSystemPrompt(final)
 		}
 	}
-	assembly := &ReusedAssembly{SystemPrompt: sysPrompt, Skills: skills, Commands: cmds, Hooks: resolvedHooks, Registry: reg}
+	assembly := &ReusedAssembly{
+		SystemPrompt:            sysPrompt,
+		Skills:                  skills,
+		Commands:                cmds,
+		Hooks:                   resolvedHooks,
+		Registry:                reg,
+		ImplicitSkillInvocation: implicitSkillInvocation,
+	}
 	return finalizeBuildResult(&BuildResult{Controller: ctrl, Snapshot: snap, Runtime: runtimeSet, Owner: owner, Extensions: extensionMgr, Dispatcher: extensionDispatcher, ExtensionUI: extUIHub, ProviderResolver: providerResolver, BaseProviderResolver: baseResolver, Assembly: assembly}, !opts.deferPublish), nil
 }
 
