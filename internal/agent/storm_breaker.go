@@ -26,6 +26,9 @@ const (
 	// todoProgressNudgeRounds is the first adaptive checkpoint. The host asks
 	// the model to reassess, but keeps the turn alive so it can recover.
 	todoProgressNudgeRounds = 8
+	// maxTodoStallRounds is the second Goal-only adaptive checkpoint. It resets
+	// the intervention epoch and asks for a new plan without ending the run.
+	maxTodoStallRounds = 16
 )
 
 func todoProgressNudgeMessage(rounds int) string {
