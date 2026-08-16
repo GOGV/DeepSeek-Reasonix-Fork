@@ -10,8 +10,6 @@ import { app, onEvent, onReady, onRuntimeRebuilt } from "./bridge";
 import { invalidateCache } from "./composerHistory";
 import { formatGuardianAssessmentNotice } from "./guardianEvents";
 import { createRafBatch } from "./rafBatch";
-import { applyLiveSegments, coalesceStreamDeltas, completeLiveReasoning, type StreamDeltaEntry, type StreamSegment } from "./streamDeltaBatch";
-import { uiPerfTracker } from "./uiPerf";
 import { t, type DictKey } from "./i18n";
 import { sameTodoList } from "./todoVisibility";
 import { fileDiffFromWire, summarize, summarizeFileDiff, type ToolFileDiff } from "./tools";
@@ -37,7 +35,6 @@ import type {
   ToolApprovalMode,
   WireApproval,
   WireAsk,
-  WireDecisionReceipt,
   WireEvent,
   WireExtensionCard,
   WireExtensionForm,
@@ -46,7 +43,6 @@ import type {
   WireFinalReadiness,
   WireTool,
   WireUsage,
-  WireShellExecution,
 } from "./types";
 
 export type ToolStatus = "running" | "done" | "error" | "stopped";
@@ -61,7 +57,6 @@ export const SUBAGENT_PROGRESS_NOTICE = "reasonix.subagent.notice";
 // Reserved names are matched by prefix so a future channel never falls back
 // to ordinary tool output on older frontends.
 const SUBAGENT_PROGRESS_PREFIX = "reasonix.subagent.";
-const TURN_ACTIVITY_KINDS = new Set(["turn_started", "text", "reasoning", "message", "tool_dispatch", "tool_progress", "tool_result"]);
 
 const SUBAGENT_PROGRESS_PHASES = new Set([
   "queued", "running", "reasoning", "responding", "tool", "retrying", "completed", "failed", "cancelled",
@@ -190,17 +185,6 @@ export type LiveStream = {
   reasoningStartedAt?: number;
   reasoningCompletedAt?: number;
 };
-
-/** Speculative journal for one sampling attempt — rolled back on discard. */
-type StreamAttemptJournal = {
-  id: string;
-  baselineLive?: LiveStream;
-  baselineTurnArgChars: number;
-  /** Tool cards created by this attempt (running, no result yet). */
-  createdToolIds: string[];
-  /** Prior state of tools that existed before this attempt and were patched. */
-  priorTools: Record<string, Extract<Item, { kind: "tool" }>>;
-};
 export type ControllerLiveStore = {
   subscribe: (tabId: string | undefined, listener: () => void) => () => void;
   getSnapshot: (tabId: string | undefined) => LiveStream | undefined;
@@ -229,10 +213,10 @@ type ModelSwitchQueueState = {
 const HISTORY_PAGE_TURNS = 60;
 
 export type Item =
-  | { kind: "user"; id: string; submissionId?: string; text: string; submitText?: string; failed?: boolean; createdAt?: number; checkpointTurn?: number }
+  | { kind: "user"; id: string; text: string; submitText?: string; failed?: boolean; createdAt?: number; checkpointTurn?: number }
   | { kind: "assistant"; id: string; text: string; reasoning: string; streaming: boolean; reasoningComplete?: boolean; reasoningDurationMs?: number; workDurationMs?: number; memoryCitations?: MemoryCitation[] }
   | { kind: "phase"; id: string; text: string }
-  | { kind: "notice"; id: string; level: "info" | "warn"; text: string; detail?: string; title?: string; variant?: "delivery"; action?: "continue_delivery"; decisionReceipt?: WireDecisionReceipt }
+  | { kind: "notice"; id: string; level: "info" | "warn"; text: string; detail?: string; title?: string; variant?: "delivery"; action?: "continue_delivery" }
   | {
       kind: "compaction";
       id: string;
@@ -259,8 +243,7 @@ export type Item =
       subject?: string; // stable collapsed subject from archived history payloads
       summary?: string; // stable collapsed readout kept even after args/output archive
       fileDiff?: ToolFileDiff; // previewed whole-file diff from writer dispatch
-      isShell?: boolean; // bash tool or !command — structured shell card presentation
-      execution?: WireShellExecution; // local shell metadata
+      isShell?: boolean; // true for !-prefix shell commands (controls default expand)
       parentId?: string; // a sub-agent call nests under the `task` call with this id
       profile?: { model?: string; effort?: string }; // subagent model/effort from tool event
       argChars?: number; // args still streaming from the model: cumulative chars received
@@ -366,7 +349,6 @@ interface State {
   currentAssistant?: string;
   live?: LiveStream;
   pendingUser?: string;
-  pendingSubmissionId?: string;
   deliveryRecoveryActive: boolean;
   discardTurn?: boolean;
   turnStartAt: number;
@@ -375,6 +357,16 @@ interface State {
   // the current turn. Used by the status bar for per-turn output-token display
   // and TPS calculation.
   turnOutputTokens: number;
+  turnOutputChars: number;
+  // Live text/reasoning characters already covered by the accumulated usage.
+  // This lets the composer estimate only the in-flight provider request.
+  turnOutputCharsAtUsage: number;
+  // True when any output-token count in the current turn is estimated.
+  turnOutputEstimated: boolean;
+  // Active provider-output intervals for the current turn. Tool execution and
+  // gaps between provider requests are intentionally excluded from TPS.
+  turnModelActiveAt?: number;
+  turnModelActiveMs: number;
   // Time spent waiting on the user (approval/ask) within the current turn.
   // Closed intervals accumulate here; an open interval uses promptWaitStartedAt
   // so background tabs keep counting while not rendered by Composer.
@@ -386,6 +378,8 @@ interface State {
   lastTurnStartAt: number;
   lastTurnDoneAt: number;
   lastTurnWaitAccumMs: number;
+  lastTurnModelMs: number;
+  lastTurnOutputEstimated: boolean;
   promptWaitStartedAt?: number;
   // promptEventClock() reading taken when the CURRENT pending prompt first
   // arrived. Orders the prompt against reconciliation snapshots so a snapshot
@@ -442,9 +436,6 @@ interface State {
   // Last accepted generation per extension surface key; guards against
   // re-ordered publications (acceptsExtensionGeneration).
   extensionGenerations: Record<string, number>;
-  // Speculative sampling-attempt journal for Codex-style stream replay.
-  // Host-local only; never hydrated from history.
-  streamAttemptJournal?: StreamAttemptJournal;
 }
 
 export const initialState: State = {
@@ -469,11 +460,17 @@ export const initialState: State = {
   turnStartAt: 0,
   turnDoneAt: 0,
   turnOutputTokens: 0,
+  turnOutputChars: 0,
+  turnOutputCharsAtUsage: 0,
+  turnOutputEstimated: false,
+  turnModelActiveMs: 0,
   turnWaitAccumMs: 0,
   lastTurnOutputTokens: 0,
   lastTurnStartAt: 0,
   lastTurnDoneAt: 0,
   lastTurnWaitAccumMs: 0,
+  lastTurnModelMs: 0,
+  lastTurnOutputEstimated: false,
   turnTokens: 0,
   turnTotalTokens: 0,
   turnCost: 0,
@@ -639,13 +636,6 @@ export function normalizeTurnSubmit(displayText: string, submitText: string): {
   return { display, submit };
 }
 
-const frontendSubmissionEpoch = typeof globalThis.crypto?.randomUUID === "function"
-  ? globalThis.crypto.randomUUID()
-  : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
-export function createTurnSubmissionId(tabId: string, sessionGen: number, seq: number, runtimeEpoch?: string): string {
-  return JSON.stringify([frontendSubmissionEpoch, tabId, sessionGen, runtimeEpoch ?? "", seq]);
-}
-
 export function acceptsRuntimeEventEpoch(acceptedEpoch: string | undefined, eventEpoch: string | undefined): boolean {
   return !eventEpoch || !acceptedEpoch || acceptedEpoch === eventEpoch;
 }
@@ -755,11 +745,9 @@ function compactArchivedToolItems(items: Item[]): Item[] {
 
 type Action =
   | { type: "event"; e: WireEvent }
-  | { type: "stream_batch"; segments: StreamSegment[] }
-  | { type: "user"; text: string; submitText?: string; seq: number; submissionId: string; deliveryRecovery?: boolean }
+  | { type: "user"; text: string; submitText?: string; seq: number; deliveryRecovery?: boolean }
   | { type: "unsend" }
-  | { type: "send_confirmed"; submissionId: string }
-  | { type: "send_failed"; submissionId: string; error: string }
+  | { type: "send_failed"; error: string }
   | { type: "backend_status"; running: boolean; pendingPrompt?: boolean; backgroundJobs?: number; cancelRequested?: boolean; cancellable?: boolean; snapshotAt?: number }
   | { type: "cancel_requested" }
   | { type: "meta"; meta: Meta }
@@ -780,6 +768,7 @@ type Action =
   | { type: "history_page"; page: HistoryPage; mode: "replace" | "prepend" }
   | { type: "history_older_start" }
   | { type: "history_older_error" }
+  | { type: "history_checkpoint_turns"; turns: number[] }
   | { type: "local_notice"; level: "info" | "warn"; text: string }
   | { type: "clearApproval" }
   | { type: "clearAsk" }
@@ -829,8 +818,8 @@ export function historyMessagesToItems(messages: HistoryMessage[], idPrefix: str
       continue;
     }
     if (m.role === "notice") {
-      if (m.content.trim() !== "" || m.decisionReceipt) {
-        const next = appendNoticeItem(items, seq, `${idPrefix}${seq}`, m.level === "warn" ? "warn" : "info", m.content, m.detail, m.code, m.decisionReceipt);
+      if (m.content.trim() !== "") {
+        const next = appendNoticeItem(items, seq, `${idPrefix}${seq}`, m.level === "warn" ? "warn" : "info", m.content, m.detail, m.code);
         items = next.items;
         seq = next.seq;
       }
@@ -895,8 +884,7 @@ export function historyMessagesToItems(messages: HistoryMessage[], idPrefix: str
           subject: tc.subject,
           summary: summarizeFileDiff(fileDiff) || tc.summary,
           fileDiff,
-          isShell: tc.name === "bash" || (tc.id || "").startsWith("shell-"),
-          execution: result?.execution,
+          isShell: (tc.id || "").startsWith("shell-"),
         });
         seq++;
       }
@@ -916,8 +904,7 @@ export function historyMessagesToItems(messages: HistoryMessage[], idPrefix: str
         output,
         error,
         dataArchived: m.toolResultArchived || undefined,
-        isShell: (m.toolName || "") === "bash" || (m.toolCallId || "").startsWith("shell-"),
-        execution: m.execution,
+        isShell: (m.toolCallId || "").startsWith("shell-"),
       });
       seq++;
       continue;
@@ -926,14 +913,18 @@ export function historyMessagesToItems(messages: HistoryMessage[], idPrefix: str
   return { items, seq };
 }
 
-function applyTurnCheckpoint(items: Item[], submissionId: string | undefined, turn: number | undefined): Item[] {
-  if (!submissionId) return items;
-  const validTurn = turn !== undefined && Number.isInteger(turn) && turn >= 0;
+function mergeHistoryCheckpointTurns(items: Item[], turns: number[], startTurn = 0): Item[] {
+  if (!turns.some((turn) => turn >= 0)) return items;
+  const offset = Math.max(0, Math.floor(startTurn));
+  let userIndex = 0;
   let changed = false;
   const next = items.map((item) => {
-    if (item.kind !== "user" || item.submissionId !== submissionId) return item;
+    if (item.kind !== "user") return item;
+    const turn = turns[offset + userIndex];
+    userIndex += 1;
+    if (turn == null || turn < 0 || item.checkpointTurn === turn) return item;
     changed = true;
-    return { ...item, submissionId: undefined, checkpointTurn: item.checkpointTurn ?? (validTurn ? turn : undefined) };
+    return { ...item, checkpointTurn: turn };
   });
   return changed ? next : items;
 }
@@ -1004,20 +995,15 @@ function liveReasoningDurationMs(live?: LiveStream): number | undefined {
   return completedAt - live.reasoningStartedAt;
 }
 
-// applyDeltaSegments folds ordered stream segments into the assistant's live
-// stream in one state transition. Assumes applyEvent's preamble already ran.
-function applyDeltaSegments(s: State, segments: StreamSegment[]): State {
-  const { items, id, seq } = ensureAssistant(s);
-  const base = s.live?.id === id ? s.live : { id, text: "", reasoning: "", reasoningComplete: false };
-  return { ...s, items, live: applyLiveSegments(base, segments, Date.now()), currentAssistant: id, seq };
-}
-
-// applyStreamBatch is the stream_batch action: one frame's deltas, one reducer
-// pass, one notification. Mirrors applyEvent's preamble for delta events.
-function applyStreamBatch(s: State, segments: StreamSegment[]): State {
-  if (s.discardTurn) return s;
-  if (s.retry) s = { ...s, retry: undefined };
-  return applyDeltaSegments(s, segments);
+function completeLiveReasoning(live: LiveStream, now = Date.now()): LiveStream {
+  if (!live.reasoning || live.reasoningCompletedAt) {
+    return { ...live, reasoningComplete: live.reasoning !== "" || live.reasoningComplete };
+  }
+  return {
+    ...live,
+    reasoningComplete: true,
+    reasoningCompletedAt: now,
+  };
 }
 
 /** Closed + open user-wait ms for the active turn (approval/ask). */
@@ -1062,7 +1048,7 @@ function endPromptWaitIfIdle(s: State, now = Date.now()): State {
   return endPromptWait(s, now);
 }
 
-function resetTurnTiming(now = Date.now()): Pick<State, "turnStartAt" | "turnDoneAt" | "turnWaitAccumMs" | "promptWaitStartedAt" | "turnTokens" | "turnTotalTokens" | "turnOutputTokens" | "turnCost" | "turnArgChars"> {
+function resetTurnTiming(now = Date.now()): Pick<State, "turnStartAt" | "turnDoneAt" | "turnWaitAccumMs" | "promptWaitStartedAt" | "turnTokens" | "turnTotalTokens" | "turnOutputTokens" | "turnOutputChars" | "turnOutputCharsAtUsage" | "turnOutputEstimated" | "turnModelActiveAt" | "turnModelActiveMs" | "turnCost" | "turnArgChars"> {
   return {
     turnStartAt: now,
     turnDoneAt: 0,
@@ -1071,14 +1057,62 @@ function resetTurnTiming(now = Date.now()): Pick<State, "turnStartAt" | "turnDon
     turnTokens: 0,
     turnTotalTokens: 0,
     turnOutputTokens: 0,
+    turnOutputChars: 0,
+    turnOutputCharsAtUsage: 0,
+    turnOutputEstimated: false,
+    turnModelActiveAt: undefined,
+    turnModelActiveMs: 0,
     turnCost: 0,
     turnArgChars: 0,
   };
 }
 
-function confirmPendingUser(s: State, submissionId: string | undefined): State {
-  if (!submissionId || s.pendingSubmissionId !== submissionId) return s;
-  return { ...s, pendingUser: undefined, pendingSubmissionId: undefined };
+function beginTurnModelActivity(s: State, now = Date.now()): State {
+  return s.turnModelActiveAt && s.turnModelActiveAt > 0
+    ? s
+    : { ...s, turnModelActiveAt: now };
+}
+
+function endTurnModelActivity(s: State, now = Date.now()): State {
+  if (!s.turnModelActiveAt || s.turnModelActiveAt <= 0) return s;
+  return {
+    ...s,
+    turnModelActiveAt: undefined,
+    turnModelActiveMs: Math.max(0, s.turnModelActiveMs) + Math.max(0, now - s.turnModelActiveAt),
+  };
+}
+
+function snapshotCompletedTurnTelemetry(s: State, now = Date.now()): State {
+  const settled = endTurnModelActivity(s, now);
+  const liveChars = (settled.live?.text.length ?? 0) + (settled.live?.reasoning.length ?? 0);
+  const inFlightChars = settled.turnOutputTokens > 0
+    ? Math.max(0, liveChars - settled.turnOutputCharsAtUsage) + settled.turnArgChars
+    : settled.turnOutputChars + settled.turnArgChars;
+  const estimatedInFlightTokens = Math.round(inFlightChars / 4);
+  return {
+    ...settled,
+    turnDoneAt: now,
+    lastTurnOutputTokens: settled.turnOutputTokens + estimatedInFlightTokens,
+    lastTurnStartAt: settled.turnStartAt,
+    lastTurnDoneAt: now,
+    lastTurnWaitAccumMs: settled.turnWaitAccumMs,
+    lastTurnModelMs: settled.turnModelActiveMs,
+    lastTurnOutputEstimated: settled.turnOutputEstimated || estimatedInFlightTokens > 0 || (settled.turnOutputTokens === 0 && settled.turnOutputChars > 0),
+  };
+}
+
+function flushPendingUser(s: State): State {
+  if (s.pendingUser === undefined) return s;
+  const lastItem = s.items[s.items.length - 1];
+  if (lastItem?.kind === "user" && lastItem.text === s.pendingUser) {
+    return { ...s, pendingUser: undefined };
+  }
+  return {
+    ...s,
+    seq: s.seq + 1,
+    items: [...s.items, { kind: "user", id: `u${s.seq}`, text: s.pendingUser, createdAt: Date.now() }],
+    pendingUser: undefined,
+  };
 }
 
 // applyExtensionSurfaceEvent reduces one extension_surface / extension_status
@@ -1161,122 +1195,6 @@ function applyExtensionForm(s: State, surface: WireExtensionSurface): State {
   };
 }
 
-function applyStreamAttempt(s: State, e: WireEvent): State {
-  const sa = e.streamAttempt;
-  if (!sa?.id || !sa.action) return s;
-  switch (sa.action) {
-    case "begin": {
-      // Snapshot only what this attempt may mutate: live text/reasoning and
-      // turnArgChars. Concurrent non-sampling events remain outside the journal.
-      const baselineLive = s.live
-        ? {
-            id: s.live.id,
-            text: s.live.text,
-            reasoning: s.live.reasoning,
-            reasoningComplete: s.live.reasoningComplete,
-            reasoningStartedAt: s.live.reasoningStartedAt,
-            reasoningCompletedAt: s.live.reasoningCompletedAt,
-          }
-        : undefined;
-      return {
-        ...s,
-        running: true,
-        turnActive: true,
-        cancellable: true,
-        turnStartAt: s.turnStartAt || Date.now(),
-        streamAttemptJournal: {
-          id: sa.id,
-          baselineLive,
-          baselineTurnArgChars: s.turnArgChars,
-          createdToolIds: [],
-          priorTools: {},
-        },
-      };
-    }
-    case "discard": {
-      const journal = s.streamAttemptJournal;
-      if (!journal || journal.id !== sa.id) {
-        // Stale/out-of-order discard for an older attempt — leave the current
-        // journal (and live speculative UI) untouched.
-        return s;
-      }
-      const remove = new Set(journal.createdToolIds);
-      const items = s.items
-        .filter((it) => !(it.kind === "tool" && remove.has(it.id)))
-        .map((it) => {
-          if (it.kind !== "tool") return it;
-          const prior = journal.priorTools[it.id];
-          return prior ? { ...prior } : it;
-        });
-      // Restore live to the pre-attempt snapshot so partial text/reasoning is
-      // replaced, not concatenated with the next attempt.
-      const live = journal.baselineLive
-        ? { ...journal.baselineLive }
-        : s.live
-          ? { ...s.live, text: "", reasoning: "", reasoningComplete: false, reasoningStartedAt: undefined, reasoningCompletedAt: undefined }
-          : undefined;
-      return {
-        ...s,
-        items,
-        live,
-        turnArgChars: journal.baselineTurnArgChars,
-        streamAttemptJournal: undefined,
-        running: true,
-        turnActive: true,
-        cancellable: true,
-      };
-    }
-    case "commit": {
-      // Commit clears bookkeeping only; subsequent tool_dispatch/result are real.
-      if (s.streamAttemptJournal && s.streamAttemptJournal.id !== sa.id) {
-        return s;
-      }
-      return { ...s, streamAttemptJournal: undefined };
-    }
-    default:
-      return s;
-  }
-}
-
-/** Record a tool card mutation against the active sampling-attempt journal.
- * Only parent-sampling partials with a matching attemptId are journaled —
- * background sub-agent tools (parentId) and committed full dispatches are not.
- */
-function noteToolInJournal(
-  s: State,
-  toolId: string,
-  existedBefore: boolean,
-  prior: Extract<Item, { kind: "tool" }> | undefined,
-  meta?: { attemptId?: string; parentId?: string; partial?: boolean },
-): State {
-  const journal = s.streamAttemptJournal;
-  if (!journal || !toolId) return s;
-  // Require explicit attempt membership — do not journal by arrival time alone.
-  if (!meta?.attemptId || meta.attemptId !== journal.id) return s;
-  if (meta.parentId) return s;
-  if (meta.partial === false) return s;
-  if (!existedBefore) {
-    if (journal.createdToolIds.includes(toolId)) return s;
-    return {
-      ...s,
-      streamAttemptJournal: {
-        ...journal,
-        createdToolIds: [...journal.createdToolIds, toolId],
-      },
-    };
-  }
-  if (prior && !journal.priorTools[toolId] && !journal.createdToolIds.includes(toolId)) {
-    return {
-      ...s,
-      streamAttemptJournal: {
-        ...journal,
-        priorTools: { ...journal.priorTools, [toolId]: { ...prior } },
-      },
-    };
-  }
-  return s;
-}
-
 function applyExtensionNotification(s: State, surface: WireExtensionSurface): State {
   const notification = surface.notification;
   if (!notification) return s;
@@ -1292,32 +1210,20 @@ function applyExtensionNotification(s: State, surface: WireExtensionSurface): St
 
 function applyEvent(s: State, e: WireEvent): State {
   if (s.discardTurn) {
-    if (e.kind === "turn_done") {
-      return {
-        ...s,
-        items: applyTurnCheckpoint(s.items, e.submissionId, e.checkpointTurn),
-        discardTurn: false,
-        running: false,
-        turnActive: false,
-        pendingPrompt: false,
-        cancelRequested: false,
-        cancellable: false,
-        currentAssistant: undefined,
-        live: undefined,
-      };
-    }
+    if (e.kind === "turn_done") return { ...s, discardTurn: false, running: false, turnActive: false, pendingPrompt: false, cancelRequested: false, cancellable: false, currentAssistant: undefined, live: undefined };
     return s;
   }
-  s = confirmPendingUser(s, e.submissionId);
   if (e.kind === "mcp_surface_ready") {
-    // Background readiness remains a no-op unless the sink explicitly
-    // correlates it to this submit in the common preamble above.
+    // Background-only events must not confirm an optimistic user bubble.
     return s;
   }
   if (e.kind === "extension_surface" || e.kind === "extension_status") {
-    // Sidecar publications without exact sink correlation remain background-
-    // only and must not clear the retry indicator.
+    // Sidecar surface publications are background-only too: they must neither
+    // confirm an optimistic user bubble nor clear the retry indicator.
     return applyExtensionSurfaceEvent(s, e.extension);
+  }
+  if (s.pendingUser !== undefined && e.kind !== "turn_done") {
+    s = flushPendingUser(s);
   }
   if (e.kind === "retrying") {
     // Retrying is emitted synchronously from inside the foreground provider
@@ -1340,19 +1246,18 @@ function applyEvent(s: State, e: WireEvent): State {
       turnStartAt: s.turnStartAt || Date.now(),
     };
   }
-  if (e.kind === "stream_attempt") {
-    return applyStreamAttempt(s, e);
-  }
   if (s.retry) s = { ...s, retry: undefined };
   switch (e.kind) {
     case "turn_started": {
-      // Pre-create an empty assistant bubble
+      // Flush the user message and pre-create an empty assistant bubble
       // immediately so the user sees their message + a blinking cursor the
       // instant the backend acknowledges the turn — no dead gap waiting for
       // the first text/reasoning token.
-      const { items, id, seq } = ensureAssistant(s);
+      let cur: State = s;
+      if (cur.pendingUser !== undefined) cur = flushPendingUser(cur);
+      const { items, id, seq } = ensureAssistant(cur);
       return {
-        ...s,
+        ...cur,
         items,
         currentAssistant: id,
         seq,
@@ -1366,8 +1271,24 @@ function applyEvent(s: State, e: WireEvent): State {
       };
     }
     case "text":
-    case "reasoning":
-      return applyDeltaSegments(s, [{ kind: e.kind, delta: e.text ?? e.reasoning ?? "" }]);
+    case "reasoning": {
+      const { items, id, seq } = ensureAssistant(s);
+      const delta = e.text ?? e.reasoning ?? "";
+      const base = s.live?.id === id ? s.live : { id, text: "", reasoning: "", reasoningComplete: false };
+      const now = Date.now();
+      const live =
+        e.kind === "text"
+          ? { ...completeLiveReasoning(base, now), text: base.text + delta }
+          : {
+              ...base,
+              reasoning: base.reasoning + delta,
+              reasoningComplete: false,
+              reasoningStartedAt: base.reasoningStartedAt ?? (delta ? now : undefined),
+              reasoningCompletedAt: undefined,
+            };
+      const next = { ...s, items, live, currentAssistant: id, seq, turnOutputChars: s.turnOutputChars + delta.length };
+      return delta ? beginTurnModelActivity(next, now) : next;
+    }
     case "message": {
       const existingAssistant =
         s.currentAssistant === undefined
@@ -1380,13 +1301,16 @@ function applyEvent(s: State, e: WireEvent): State {
           existingAssistant && existingAssistant.text.trim() === "" && existingAssistant.reasoning.trim() === "" && !existingAssistant.memoryCitations?.length
             ? s.items.filter((it) => !(it.kind === "assistant" && it.id === existingAssistant.id))
             : s.items;
-        return { ...s, items, live: undefined, currentAssistant: undefined };
+        return { ...endTurnModelActivity(s), items, live: undefined, currentAssistant: undefined, turnOutputCharsAtUsage: 0 };
       }
-      const { items, id, seq } = ensureAssistant(s);
       const now = Date.now();
-      const completedLive = s.live?.id === id ? completeLiveReasoning({ ...s.live, text, reasoning }, now) : undefined;
+      const settled = endTurnModelActivity(s, now);
+      const { items, id, seq } = ensureAssistant(settled);
+      const streamedChars = settled.live?.id === id ? settled.live.text.length + settled.live.reasoning.length : 0;
+      const turnOutputChars = Math.max(0, settled.turnOutputChars - streamedChars + text.length + reasoning.length);
+      const completedLive = settled.live?.id === id ? completeLiveReasoning({ ...settled.live, text, reasoning }, now) : undefined;
       const reasoningDurationMs = liveReasoningDurationMs(completedLive);
-      const workDurationMs = currentTurnDurationMs(s, now);
+      const workDurationMs = currentTurnDurationMs(settled, now);
       const next = items.map((it) =>
         it.kind === "assistant" && it.id === id
           ? (() => {
@@ -1404,7 +1328,7 @@ function applyEvent(s: State, e: WireEvent): State {
             })()
           : it,
       );
-      return { ...s, items: next, live: undefined, currentAssistant: undefined, seq };
+      return { ...settled, items: next, live: undefined, currentAssistant: undefined, turnOutputChars, turnOutputCharsAtUsage: 0, seq };
     }
     case "tool_dispatch": {
       const t = e.tool;
@@ -1415,38 +1339,37 @@ function applyEvent(s: State, e: WireEvent): State {
       // zero visible activity, indistinguishable from a hang. The full
       // dispatch that follows merges by ID and fills in args/summary.
       if (t.partial) {
+        const activeState = t.parentId ? s : beginTurnModelActivity(s);
         const turnArgChars = t.argChars && t.argChars > 0 ? t.argChars : s.turnArgChars;
         // Some OpenAI-compatible streams surface the call name before its ID.
         // Without a stable ID the card could never be merged with the full
         // dispatch (a synthetic `tool${seq}` id would orphan it as a forever-
         // running duplicate), so count the progress but wait for the ID before
         // creating the card.
-        if (!t.id) return { ...s, turnArgChars };
+        if (!t.id) return { ...activeState, turnArgChars };
         const id = t.id;
-        const idx = s.items.findIndex((it) => it.kind === "tool" && it.id === id);
+        const idx = activeState.items.findIndex((it) => it.kind === "tool" && it.id === id);
         if (idx >= 0) {
-          const next = [...s.items];
+          const next = [...activeState.items];
           const it = next[idx];
           if (it.kind === "tool" && it.status === "running" && !it.args) {
-            const prior = it;
             next[idx] = { ...it, argChars: t.argChars || it.argChars };
-            return noteToolInJournal({ ...s, items: next, turnArgChars }, id, true, prior, {
-              attemptId: t.attemptId, parentId: t.parentId, partial: true,
-            });
+            return { ...activeState, items: next, turnArgChars };
           }
-          return { ...s, turnArgChars };
+          return { ...activeState, turnArgChars };
         }
-        return noteToolInJournal({
-          ...s,
+        return {
+          ...activeState,
           turnArgChars,
           seq: s.seq + 1,
           items: [...s.items, { kind: "tool", id, name: t.name, args: "", readOnly: t.readOnly, resolvedName: t.resolvedName, capabilityId: t.capabilityId, status: "running", argChars: t.argChars || undefined, parentId: t.parentId, subagentProgress: SUBAGENT_PROGRESS_TOOLS.has(t.name) ? freshSubagentProgress() : undefined }],
-        }, id, false, undefined, { attemptId: t.attemptId, parentId: t.parentId, partial: true });
+        };
       }
+      const settled = t.parentId ? s : endTurnModelActivity(s);
       const id = t.id || `tool${s.seq}`;
-      const idx = s.items.findIndex((it) => it.kind === "tool" && it.id === id);
+      const idx = settled.items.findIndex((it) => it.kind === "tool" && it.id === id);
       if (idx >= 0) {
-        const next = [...s.items];
+        const next = [...settled.items];
         const it = next[idx];
         if (it.kind === "tool") {
           const args = t.args ? t.args : it.args;
@@ -1455,17 +1378,16 @@ function applyEvent(s: State, e: WireEvent): State {
           next[idx] = { ...it, name: t.name, args, readOnly: t.readOnly, resolvedName: t.resolvedName ?? it.resolvedName, capabilityId: t.capabilityId ?? it.capabilityId, profile: t.profile ?? it.profile, summary, fileDiff, argChars: undefined, subagentProgress: it.subagentProgress ?? (SUBAGENT_PROGRESS_TOOLS.has(t.name) ? freshSubagentProgress() : undefined) };
         }
         if (t.parentId) touchSubagentParent(next, t.parentId);
-        // Full dispatches are committed work — never journal them as speculative.
-        return { ...s, items: next };
+        return { ...settled, items: next };
       }
       const args = t.args ?? "";
       const fileDiff = fileDiffFromWire(t);
-      const created: ToolItem = { kind: "tool", id, name: t.name, args, readOnly: t.readOnly, resolvedName: t.resolvedName, capabilityId: t.capabilityId, status: "running", summary: summarizeFileDiff(fileDiff) || summarize(t.name, args), fileDiff, isShell: t.name === "bash" || id.startsWith("shell-"), execution: t.execution, parentId: t.parentId, profile: t.profile, subagentProgress: SUBAGENT_PROGRESS_TOOLS.has(t.name) ? freshSubagentProgress() : undefined };
-      const items = [...s.items, created];
+      const created: ToolItem = { kind: "tool", id, name: t.name, args, readOnly: t.readOnly, resolvedName: t.resolvedName, capabilityId: t.capabilityId, status: "running", summary: summarizeFileDiff(fileDiff) || summarize(t.name, args), fileDiff, isShell: id.startsWith("shell-"), parentId: t.parentId, profile: t.profile, subagentProgress: SUBAGENT_PROGRESS_TOOLS.has(t.name) ? freshSubagentProgress() : undefined };
+      const items = [...settled.items, created];
       // A sub-agent call nested under a task card refreshes that card's
       // recent activity and switches its phase to "tool".
       if (t.parentId) touchSubagentParent(items, t.parentId);
-      return { ...s, seq: s.seq + 1, items };
+      return { ...settled, seq: settled.seq + 1, items };
     }
     case "tool_result": {
       const t = e.tool;
@@ -1520,8 +1442,6 @@ function applyEvent(s: State, e: WireEvent): State {
             truncated: t.truncated,
             durationMs: t.durationMs,
             summary,
-            isShell: existing.isShell || existing.name === "bash" || t.name === "bash",
-            execution: t.execution ?? existing.execution,
           };
         }
       }
@@ -1548,34 +1468,26 @@ function applyEvent(s: State, e: WireEvent): State {
     }
     case "usage": {
       if (!countsTowardCurrentTurn(s)) return s;
+      const settled = endTurnModelActivity(s);
       const updateContextGauge = updatesContextGauge(e.usage);
-      // Prefer Context* (latest attempt) over billable aggregates when multi-
-      // attempt sampling recovery folds several provider calls into one Usage.
-      // Matches Controller.ContextSnapshot: latest prompt + completion.
-      let used = s.context.used;
-      if (e.usage && s.context.window && updateContextGauge) {
-        const hasContext =
-          (e.usage.contextPromptTokens ?? 0) > 0 || (e.usage.contextCompletionTokens ?? 0) > 0;
-        used = hasContext
-          ? (e.usage.contextPromptTokens ?? 0) + (e.usage.contextCompletionTokens ?? 0)
-          : (e.usage.promptTokens ?? 0) + (e.usage.completionTokens ?? 0);
-      }
-      const turnTokens = s.turnTokens + (e.usage?.completionTokens ?? 0);
-      const turnOutputTokens = s.turnOutputTokens + (e.usage?.completionTokens ?? 0) + (e.usage?.reasoningTokens ?? 0);
+      const used = e.usage && settled.context.window && updateContextGauge ? e.usage.promptTokens : settled.context.used;
+      const turnTokens = settled.turnTokens + (e.usage?.completionTokens ?? 0);
+      const turnOutputTokens = settled.turnOutputTokens + (e.usage?.completionTokens ?? 0) + (e.usage?.reasoningTokens ?? 0);
+      const turnOutputCharsAtUsage = (settled.live?.text.length ?? 0) + (settled.live?.reasoning.length ?? 0);
       const usageTokens = usageTotalTokens(e.usage);
-      const turnTotalTokens = s.turnTotalTokens + usageTokens;
-      const sessionTokens = s.sessionTokens + usageTokens;
+      const turnTotalTokens = settled.turnTotalTokens + usageTokens;
+      const sessionTokens = settled.sessionTokens + usageTokens;
       const usageCost = e.usage?.cost ?? e.usage?.costUsd ?? 0;
-      const turnCost = s.turnCost + usageCost;
-      const sessionCost = s.sessionCost + usageCost;
-      const sessionCurrency = e.usage?.currency || s.sessionCurrency || "¥";
-      const usage = updateContextGauge ? e.usage : s.usage;
+      const turnCost = settled.turnCost + usageCost;
+      const sessionCost = settled.sessionCost + usageCost;
+      const sessionCurrency = e.usage?.currency || settled.sessionCurrency || "¥";
+      const usage = updateContextGauge ? e.usage : settled.usage;
       // The completed round's usage now accounts for the streamed tool-call
       // arguments, so drop the live estimate rather than double-count it.
-      return { ...s, usage, context: { ...s.context, used, sessionTokens }, turnTokens, turnOutputTokens, turnTotalTokens, turnCost, turnArgChars: 0, sessionTokens, sessionCost, sessionCurrency, usageSeq: s.usageSeq + 1 };
+      return { ...settled, usage, context: { ...settled.context, used, sessionTokens }, turnTokens, turnOutputTokens, turnOutputCharsAtUsage, turnOutputEstimated: settled.turnOutputEstimated || Boolean(e.usage?.estimated), turnTotalTokens, turnCost, turnArgChars: 0, sessionTokens, sessionCost, sessionCurrency, usageSeq: settled.usageSeq + 1 };
     }
     case "notice":
-      return appendNoticeToState(s, e.level ?? "info", e.text ?? "", e.detail, e.code, e.decisionReceipt);
+      return appendNoticeToState(s, e.level ?? "info", e.text ?? "", e.detail, e.code);
     case "phase":
       return { ...s, seq: s.seq + 1, items: [...s.items, { kind: "phase", id: `p${s.seq}`, text: e.text ?? "" }] };
     case "compaction_started":
@@ -1634,8 +1546,9 @@ function applyEvent(s: State, e: WireEvent): State {
       return { ...s, seq: s.seq + 1, items: [...s.items, { kind: "notice", id: `g${s.seq}`, level, text: formatGuardianAssessmentNotice(e.guardian) }] };
     }
     case "turn_done": {
+      if (s.pendingUser !== undefined) s = flushPendingUser(s);
       const now = Date.now();
-      s = { ...s, turnDoneAt: now, lastTurnOutputTokens: s.turnOutputTokens, lastTurnStartAt: s.turnStartAt, lastTurnDoneAt: now, lastTurnWaitAccumMs: s.turnWaitAccumMs };
+      s = snapshotCompletedTurnTelemetry(s, now);
       const workDurationMs = currentTurnDurationMs(s, now);
       let lastUserIndex = -1;
       let lastAssistantIndex = -1;
@@ -1708,9 +1621,8 @@ function applyEvent(s: State, e: WireEvent): State {
       const keepPlanApproval = s.approval?.tool === "exit_plan_mode";
       let next: State = {
         ...s,
-        items: applyTurnCheckpoint(items, e.submissionId, e.checkpointTurn),
+        items,
         live: undefined,
-        streamAttemptJournal: undefined,
         running: keepPlanApproval,
         turnActive: keepPlanApproval,
         pendingPrompt: keepPlanApproval,
@@ -1734,11 +1646,10 @@ export function reducer(s: State, a: Action): State {
   switch (a.type) {
     case "user": {
       const seq = a.seq !== undefined ? a.seq : s.seq;
-      const userItemId = `u${seq}`;
       return {
         ...s,
         seq: seq + 1,
-        items: [...s.items, { kind: "user", id: userItemId, submissionId: a.submissionId, text: a.text, submitText: a.submitText, createdAt: Date.now() }],
+        items: [...s.items, { kind: "user", id: `u${seq}`, text: a.text, submitText: a.submitText, createdAt: Date.now() }],
         running: true,
         pendingPrompt: false,
         cancelRequested: false,
@@ -1749,7 +1660,6 @@ export function reducer(s: State, a: Action): State {
         promptArrivedAt: undefined,
         promptArrivedId: undefined,
         pendingUser: a.text,
-        pendingSubmissionId: a.submissionId,
         deliveryRecoveryActive: Boolean(a.deliveryRecovery),
         discardTurn: false,
       };
@@ -1758,7 +1668,6 @@ export function reducer(s: State, a: Action): State {
       const cleared = endPromptWait({
         ...s,
         pendingUser: undefined,
-        pendingSubmissionId: undefined,
         discardTurn: true,
         running: false,
         pendingPrompt: false,
@@ -1784,13 +1693,16 @@ export function reducer(s: State, a: Action): State {
         cancellable: s.running || s.turnActive,
       });
     }
-    case "send_confirmed": return confirmPendingUser(s, a.submissionId);
     case "send_failed": {
-      if (s.pendingSubmissionId !== a.submissionId) return s;
-      const idx = s.items.findIndex((it) => it.kind === "user" && it.submissionId === a.submissionId);
-      const items = idx >= 0 ? s.items.map((it, i) => (i === idx ? { ...it, submissionId: undefined, failed: true } : it)) : s.items;
+      if (s.pendingUser === undefined) return s;
+      let idx = -1;
+      for (let i = s.items.length - 1; i >= 0; i--) {
+        const it = s.items[i];
+        if (it.kind === "user" && it.text === s.pendingUser) { idx = i; break; }
+      }
+      const items = idx >= 0 ? s.items.map((it, i) => (i === idx ? { ...it, failed: true } : it)) : s.items;
       const notice: Item = { kind: "notice", id: `n${s.seq}`, level: "warn", text: a.error };
-      return { ...s, pendingUser: undefined, pendingSubmissionId: undefined, deliveryRecoveryActive: false, running: false, turnActive: false, pendingPrompt: false, cancelRequested: false, cancellable: false, live: undefined, seq: s.seq + 1, items: [...items, notice] };
+      return { ...s, pendingUser: undefined, deliveryRecoveryActive: false, running: false, turnActive: false, pendingPrompt: false, cancelRequested: false, cancellable: false, live: undefined, seq: s.seq + 1, items: [...items, notice] };
     }
     case "backend_status": {
       // A snapshot fetched before the live approval/ask event arrived cannot
@@ -1828,14 +1740,15 @@ export function reducer(s: State, a: Action): State {
           turnStartAt: s.turnStartAt || Date.now(),
         };
       }
-      const finalized = s.items.map((it) => {
-        if (it.kind === "assistant" && s.live && it.id === s.live.id) return { ...it, text: s.live.text, reasoning: s.live.reasoning, streaming: false };
+      const telemetry = snapshotCompletedTurnTelemetry(s);
+      const finalized = telemetry.items.map((it) => {
+        if (it.kind === "assistant" && telemetry.live && it.id === telemetry.live.id) return { ...it, text: telemetry.live.text, reasoning: telemetry.live.reasoning, streaming: false };
         if (it.kind === "assistant" && it.streaming) return { ...it, streaming: false };
         if (it.kind === "tool" && it.status === "running") return { ...it, status: "stopped" as const };
         return it;
       });
       return endPromptWait({
-        ...s,
+        ...telemetry,
         items: finalized,
         running: false,
         turnActive: false,
@@ -1915,7 +1828,7 @@ export function reducer(s: State, a: Action): State {
     case "message_action_done": return { ...s, messageAction: undefined };
     case "history": {
       const { items, seq } = historyMessagesToItems(a.messages, "h", s.seq);
-      return { ...s, items: compactArchivedToolItems(items), pendingSubmissionId: undefined, seq, hydrateHistoryLoaded: true, hydratePlaceholderItems: undefined, historyStartTurn: 0, historyTotalTurns: 0, historyHasOlder: false, historyOlderLoading: false };
+      return { ...s, items: compactArchivedToolItems(items), seq, hydrateHistoryLoaded: true, hydratePlaceholderItems: undefined, historyStartTurn: 0, historyTotalTurns: 0, historyHasOlder: false, historyOlderLoading: false };
     }
     case "history_page": {
       const { items, seq } = historyPageItems(a.page);
@@ -1923,7 +1836,6 @@ export function reducer(s: State, a: Action): State {
       return {
         ...s,
         items: compactArchivedToolItems(nextItems),
-        pendingSubmissionId: a.mode === "replace" ? undefined : s.pendingSubmissionId,
         seq: Math.max(s.seq, seq),
         hydrateHistoryLoaded: true,
         hydratePlaceholderItems: undefined,
@@ -1935,6 +1847,8 @@ export function reducer(s: State, a: Action): State {
     }
     case "history_older_start": return s.historyOlderLoading ? s : { ...s, historyOlderLoading: true };
     case "history_older_error": return s.historyOlderLoading ? { ...s, historyOlderLoading: false } : s;
+    case "history_checkpoint_turns":
+      return { ...s, items: mergeHistoryCheckpointTurns(s.items, a.turns, s.historyStartTurn) };
     case "local_notice": return { ...s, running: false, turnActive: false, seq: s.seq + 1, items: [...s.items, { kind: "notice", id: `n${s.seq}`, level: a.level, text: a.text }] };
     case "clearApproval": {
       const next = { ...s, approval: undefined, pendingPrompt: Boolean(s.ask), resolvedPromptId: s.approval?.id ?? s.resolvedPromptId };
@@ -1980,9 +1894,7 @@ export function reducer(s: State, a: Action): State {
       // the id-anchored bookkeeping.
       return {
         ...s,
-        items: s.items.map((item) => item.kind === "user" && item.submissionId ? { ...item, submissionId: undefined } : item),
         promptEpoch: s.promptEpoch + 1,
-        pendingSubmissionId: undefined,
         resolvedPromptId: undefined,
         promptArrivedId: undefined,
         promptArrivedAt: undefined,
@@ -1994,7 +1906,6 @@ export function reducer(s: State, a: Action): State {
     case "reset": return { ...initialState, meta: metaWithoutCanonicalTodos(s.meta), context: { used: 0, window: s.context.window, sessionTokens: 0, compactRatio: s.context.compactRatio }, balance: s.balance, effort: s.effort, jobs: s.jobs, hydrating: s.hydrating, hydrateReason: s.hydrateReason, hydrateError: s.hydrateError, hydrateHistoryLoaded: s.hydrateHistoryLoaded, hydratePlaceholderItems: s.hydratePlaceholderItems, backendActivationPending: s.backendActivationPending, sessionGen: s.sessionGen + 1, promptEpoch: s.promptEpoch + 1 };
     case "context_panel_refresh": return { ...s, contextPanelSeq: s.contextPanelSeq + 1 };
     case "event": return applyEvent(s, a.e);
-    case "stream_batch": return applyStreamBatch(s, a.segments);
     default: return s;
   }
 }
@@ -2099,7 +2010,6 @@ const noticeCodeKeys: Record<string, DictKey> = {
   session_recovery_adopted_covered: "recovery.noticeAdoptedCovered",
   session_recovery_depth_cap: "recovery.noticeKeptCurrent",
   session_shutdown_recovery_forked: "recovery.noticeSavedCopy",
-  decision_receipt: "notice.decisionReceiptTitle",
 };
 
 // localizedNoticeText localizes a notice's main copy by its stable code first,
@@ -2203,6 +2113,10 @@ function backendNoticeKey(msg: string): DictKey | "" {
       return "notice.goalNotReady";
     case "Goal still has unfinished task state; continuing the remaining work.":
       return "notice.goalUnfinished";
+    case "AutoResearch status update failed.":
+      return "notice.autoresearchStatusFailed";
+    case "AutoResearch task marked blocked.":
+      return "notice.autoresearchBlocked";
     case "Job artifact migration failed.":
       return "notice.jobArtifactMigrationFailed";
     case "Background job teardown timed out.":
@@ -2297,7 +2211,7 @@ function quietTranscriptNoticeKey(text: string, code?: string): string {
   return "";
 }
 
-function appendNoticeItem(items: Item[], seq: number, id: string, level: "info" | "warn", rawText: string, detail?: string, code?: string, decisionReceipt?: WireDecisionReceipt): { items: Item[]; seq: number } {
+function appendNoticeItem(items: Item[], seq: number, id: string, level: "info" | "warn", rawText: string, detail?: string, code?: string): { items: Item[]; seq: number } {
   if (quietTranscriptNoticeKey(rawText, code)) {
     return { items, seq };
   }
@@ -2306,11 +2220,11 @@ function appendNoticeItem(items: Item[], seq: number, id: string, level: "info" 
     return { items, seq };
   }
   const trimmedDetail = detail?.trim();
-  return { items: [...items, { kind: "notice", id, level, text, ...(trimmedDetail ? { detail: trimmedDetail } : {}), ...(decisionReceipt ? { decisionReceipt } : {}) }], seq: seq + 1 };
+  return { items: [...items, { kind: "notice", id, level, text, ...(trimmedDetail ? { detail: trimmedDetail } : {}) }], seq: seq + 1 };
 }
 
-function appendNoticeToState(s: State, level: "info" | "warn", text: string, detail?: string, code?: string, decisionReceipt?: WireDecisionReceipt): State {
-  const next = appendNoticeItem(s.items, s.seq, `n${s.seq}`, level, text, detail, code, decisionReceipt);
+function appendNoticeToState(s: State, level: "info" | "warn", text: string, detail?: string, code?: string): State {
+  const next = appendNoticeItem(s.items, s.seq, `n${s.seq}`, level, text, detail, code);
   return { ...s, running: s.turnActive ? s.running : false, seq: next.seq, items: next.items };
 }
 
@@ -2468,11 +2382,10 @@ export function useController() {
     const next = reducer(prev, action);
     if (prev !== next) {
       states.set(tabId, next);
-      uiPerfTracker.onStateCommit();
       notifyLiveListeners(tabId);
       const streamDeltaOnly =
-        (action.type === "stream_batch" ||
-          (action.type === "event" && (action.e.kind === "text" || action.e.kind === "reasoning"))) &&
+        action.type === "event" &&
+        (action.e.kind === "text" || action.e.kind === "reasoning") &&
         prev.items === next.items &&
         prev.currentAssistant === next.currentAssistant &&
         prev.pendingUser === next.pendingUser &&
@@ -2944,9 +2857,8 @@ export function useController() {
   }, [clearCancelReconcileTimer, reconcileTabRuntime]);
 
   useEffect(() => {
-    const textBatch = createRafBatch<StreamDeltaEntry>((batch) => {
-      uiPerfTracker.onStreamDispatch();
-      for (const b of coalesceStreamDeltas(batch)) dispatchTo(b.tabId, { type: "stream_batch", segments: b.segments });
+    const textBatch = createRafBatch<{ tabId: string; e: WireEvent }>((batch) => {
+      for (const { tabId, e } of batch) dispatchTo(tabId, { type: "event", e });
     });
     const off = onEvent((e) => {
       // Untagged compatibility events belong to the tab that the backend has
@@ -2960,16 +2872,29 @@ export function useController() {
         if (!acceptsRuntimeEventEpoch(acceptedEpoch, e.runtimeEpoch)) return;
         if (!acceptedEpoch) runtimeEpochByTabRef.current.set(targetTabId, e.runtimeEpoch);
       }
-      uiPerfTracker.onWireEvent(targetTabId, e.kind);
-      if (TURN_ACTIVITY_KINDS.has(e.kind)) lastTurnActivityAtByTab.current.set(targetTabId, Date.now());
+      if (
+        e.kind === "turn_started" ||
+        e.kind === "text" ||
+        e.kind === "reasoning" ||
+        e.kind === "message" ||
+        e.kind === "tool_dispatch" ||
+        e.kind === "tool_progress" ||
+        e.kind === "tool_result"
+      ) {
+        lastTurnActivityAtByTab.current.set(targetTabId, Date.now());
+      }
       if (e.kind === "text" || e.kind === "reasoning") {
-        if (e.submissionId) dispatchTo(targetTabId, { type: "send_confirmed", submissionId: e.submissionId });
         textBatch.push({ tabId: targetTabId, e });
       } else {
         textBatch.drain();
         dispatchTo(targetTabId, { type: "event", e });
       }
       if (e.kind === "turn_done") {
+        if (!e.err) {
+          app.HistoryCheckpointTurnsForTab(targetTabId)
+            .then((turns) => dispatchTo(targetTabId, { type: "history_checkpoint_turns", turns: asArray(turns) }))
+            .catch(() => {});
+        }
         app
           .ContextUsageForTab(targetTabId)
           .then((context) => dispatchTo(targetTabId, { type: "context", context }))
@@ -3154,15 +3079,14 @@ export function useController() {
       throw new Error(runtime?.issue?.message || currentState.meta.startupErr || t("composer.workspaceStarting"));
     }
     const seq = currentState.seq;
-    const submissionId = createTurnSubmissionId(tabId, currentState.sessionGen, seq, runtimeEpochByTabRef.current.get(tabId) ?? runtime?.epoch);
     const promptEpoch = currentState.promptEpoch;
     const { display, submit } = normalizeTurnSubmit(displayText, submitText);
     const original = originalText?.trim() ?? "";
-    dispatchTo(tabId, { type: "user", text: displayText, submitText: display !== submit ? submit : undefined, seq, submissionId });
+    dispatchTo(tabId, { type: "user", text: displayText, submitText: display !== submit ? submit : undefined, seq });
     invalidateCache();
     try {
       const submitPromise = initialGoal
-        ? app.SubmitInitialGoalToTabWithID(
+        ? app.SubmitInitialGoalToTab(
             tabId,
             initialGoal.goal,
             structured?.display.trim() || display,
@@ -3170,26 +3094,23 @@ export function useController() {
             structured?.invocations ?? [],
             initialGoal.collaborationMode,
             initialGoal.toolApprovalMode,
-            submissionId,
           )
         : structured
-        ? app.SubmitInvocationsToTabWithID(tabId, structured.display.trim(), structured.input.trim(), structured.invocations, submissionId)
+        ? app.SubmitInvocationsToTab(tabId, structured.display.trim(), structured.input.trim(), structured.invocations)
         : original
-        ? app.SubmitEditedDisplayToTabWithID(tabId, display, submit, original, submissionId)
-        : display !== submit ? app.SubmitDisplayToTabWithID(tabId, display, submit, submissionId) : app.SubmitToTabWithID(tabId, submit, submissionId);
+        ? app.SubmitEditedDisplayToTab(tabId, display, submit, original)
+        : display !== submit ? app.SubmitDisplayToTab(tabId, display, submit) : app.SubmitToTab(tabId, submit);
       if (initialGoal) {
         const drained = await submitPromise;
-        dispatchTo(tabId, { type: "send_confirmed", submissionId });
         const ids = Array.isArray(drained) ? drained : [];
         if (ids.length) dispatchTo(tabId, { type: "approval_drained", ids, epoch: promptEpoch });
         return;
       }
-      void submitPromise.then(
-        () => dispatchTo(tabId, { type: "send_confirmed", submissionId }),
-        (error) => dispatchTo(tabId, { type: "send_failed", submissionId, error: `Send failed: ${error instanceof Error ? error.message : String(error)}` }),
-      );
+      void submitPromise.catch((error) => {
+        dispatchTo(tabId, { type: "send_failed", error: `Send failed: ${error instanceof Error ? error.message : String(error)}` });
+      });
     } catch (error) {
-      dispatchTo(tabId, { type: "send_failed", submissionId, error: `Send failed: ${error instanceof Error ? error.message : String(error)}` });
+      dispatchTo(tabId, { type: "send_failed", error: `Send failed: ${error instanceof Error ? error.message : String(error)}` });
       throw error;
     }
   }, [dispatchTo]);
@@ -3202,18 +3123,16 @@ export function useController() {
       throw new Error(runtime?.issue?.message || currentState.meta.startupErr || t("composer.workspaceStarting"));
     }
     const seq = currentState.seq;
-    const submissionId = createTurnSubmissionId(tabId, currentState.sessionGen, seq, runtimeEpochByTabRef.current.get(tabId) ?? runtime?.epoch);
     const display = displayText.trim();
     const submit = submitText.trim();
-    dispatchTo(tabId, { type: "user", text: displayText, submitText: display !== submit ? submit : undefined, seq, submissionId, deliveryRecovery: true });
+    dispatchTo(tabId, { type: "user", text: displayText, submitText: display !== submit ? submit : undefined, seq, deliveryRecovery: true });
     invalidateCache();
     try {
-      void app.SubmitDeliveryRecoveryToTabWithID(tabId, display, submit, submissionId).then(
-        () => dispatchTo(tabId, { type: "send_confirmed", submissionId }),
-        (error) => dispatchTo(tabId, { type: "send_failed", submissionId, error: `Send failed: ${error instanceof Error ? error.message : String(error)}` }),
-      );
+      void app.SubmitDeliveryRecoveryToTab(tabId, display, submit).catch((error) => {
+        dispatchTo(tabId, { type: "send_failed", error: `Send failed: ${error instanceof Error ? error.message : String(error)}` });
+      });
     } catch (error) {
-      dispatchTo(tabId, { type: "send_failed", submissionId, error: `Send failed: ${error instanceof Error ? error.message : String(error)}` });
+      dispatchTo(tabId, { type: "send_failed", error: `Send failed: ${error instanceof Error ? error.message : String(error)}` });
       throw error;
     }
   }, [dispatchTo]);
@@ -3236,14 +3155,11 @@ export function useController() {
 
   const runShellForTab = useCallback(async (tabId: string, command: string) => {
     if (!tabId) throw new Error(t("composer.workspaceStarting"));
-    const currentState = getOrCreateState(statesRef.current, tabId);
-    const submissionId = createTurnSubmissionId(tabId, currentState.sessionGen, currentState.seq, runtimeEpochByTabRef.current.get(tabId) ?? currentState.meta?.runtime?.epoch);
-    dispatchTo(tabId, { type: "user", text: `!${command}`, seq: currentState.seq, submissionId });
+    dispatchTo(tabId, { type: "user", text: `!${command}`, seq: getOrCreateState(statesRef.current, tabId).seq });
     try {
       await app.RunShellForTab(tabId, command);
-      dispatchTo(tabId, { type: "send_confirmed", submissionId });
     } catch (error) {
-      dispatchTo(tabId, { type: "send_failed", submissionId, error: `Command failed: ${error instanceof Error ? error.message : String(error)}` });
+      dispatchTo(tabId, { type: "send_failed", error: `Command failed: ${error instanceof Error ? error.message : String(error)}` });
       throw error;
     }
   }, [dispatchTo]);
@@ -3326,20 +3242,6 @@ export function useController() {
       // The backend never actually resolved this prompt — undo the optimistic
       // tombstone and ask it to replay, so the approval card can come back
       // instead of being silently lost forever (#6432 round 3).
-      dispatchTo(tabId, { type: "submit_prompt_failed", id, epoch });
-      replayPendingPromptsForActiveTab(tabId);
-    });
-  }, [activeTabId, dispatchTo]);
-
-  const resolvePlanDecision = useCallback((id: string, action: "start_execution" | "revise_plan" | "exit_plan") => {
-    if (!activeTabId) return;
-    const tabId = activeTabId;
-    const epoch = statesRef.current.get(tabId)?.promptEpoch ?? 0;
-    dispatchTo(tabId, { type: "clearApproval" });
-    const request = typeof app.ResolvePlanDecisionTab === "function"
-      ? app.ResolvePlanDecisionTab(tabId, id, action)
-      : app.ApproveTab(tabId, id, action === "start_execution", false, false);
-    request.catch(() => {
       dispatchTo(tabId, { type: "submit_prompt_failed", id, epoch });
       replayPendingPromptsForActiveTab(tabId);
     });
@@ -4205,7 +4107,7 @@ export function useController() {
     state: activeState,
     liveStore,
     activeTabId,
-    send, sendToTab, recoverDeliveryToTab, runShell, runShellForTab, steer, steerForTab, notice, cancel, approve, resolvePlanDecision, resolveRecovery, answerQuestion, setControllerMode,
+    send, sendToTab, recoverDeliveryToTab, runShell, runShellForTab, steer, steerForTab, notice, cancel, approve, resolveRecovery, answerQuestion, setControllerMode,
     dismissExtensionForm, drainExtensionNotifications,
     setCollaborationMode, setCollaborationModeForTab, setToolApprovalMode, setToolApprovalModeForTab, setComposerProfileForTab, setGoal, setGoalForTab, clearGoal, clearGoalForTab, resumeGoal, resumeGoalForTab, pauseGoal, pauseGoalForTab,
     newSession, clearSession, listSessions, listTrashedSessions, resumeSession, openChannelSession, previewSession, deleteSession, restoreSession, purgeTrashedSession, renameSession,
