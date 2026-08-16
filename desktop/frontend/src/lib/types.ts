@@ -25,7 +25,8 @@ export type EventKind =
   | "guardian_assessment"
   | "extension_surface"
   | "extension_status"
-  | "stream_attempt";
+  | "stream_attempt"
+  | "workspace_changed";
 
 export type StreamAttemptAction = "begin" | "discard" | "commit";
 
@@ -305,8 +306,7 @@ export interface WireEvent {
   /** Optional: "headers" | "stream". Older clients ignore unknown fields. */
   retryScope?: "headers" | "stream";
   streamAttempt?: WireStreamAttempt;
-  /** Durable session-inbox item id for steer / TurnDone correlation. */
-  itemId?: string;
+  workspace?: WireWorkspaceChanged;
   tabId?: string; // Go's tabEventSink tags events for the correct per-tab reducer.
   runtimeEpoch?: string;
   sessionHitTokens?: number;
@@ -315,6 +315,31 @@ export interface WireEvent {
   sessionCurrency?: string;
   // Deprecated compatibility alias. Prefer sessionCost + sessionCurrency.
   sessionCostUsd?: number;
+}
+
+export type WorkspaceWatchState = "active" | "degraded" | "unavailable";
+export type WorkspaceChangeOp = "create" | "write" | "remove" | "rename" | "unknown";
+
+export interface WorkspaceRevisions {
+  content: number;
+  tree: number;
+  workingTree: number;
+  gitMeta: number;
+  session: number;
+}
+
+export interface WorkspacePathChange {
+  path: string;
+  oldPath?: string;
+  op: WorkspaceChangeOp;
+}
+
+export interface WireWorkspaceChanged {
+  revisions: WorkspaceRevisions;
+  changes: WorkspacePathChange[];
+  allPaths: boolean;
+  source: "agent" | "filesystem" | "git" | "mixed" | "reconcile";
+  watchState: WorkspaceWatchState;
 }
 
 export type SessionRuntimePhase = "starting" | "ready" | "lease_blocked" | "failed" | "closing";
@@ -2130,7 +2155,7 @@ export interface ExternalOpenerView {
 
 export interface ExternalOpenersView {
   openers: ExternalOpenerView[];
-  preferred: string; workspaceOpenable?: boolean;
+  preferred: string;
 }
 
 // Auto-updater payloads (desktop/updater.go). UpdateInfo drives the update banner;
