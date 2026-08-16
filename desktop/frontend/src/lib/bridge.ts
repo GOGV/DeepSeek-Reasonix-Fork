@@ -211,6 +211,7 @@ export interface AppBindings {
       state: string;
       preview: string;
       byteSize: number;
+      source?: string;
       position: number;
       blockReason?: string;
     }>;
