@@ -52,8 +52,9 @@ import { ExtensionFormDialog } from "./components/ExtensionFormDialog";
 import { ClearContextCard } from "./components/ClearContextCard";
 import { RuntimeDecisionCard } from "./components/RuntimeDecisionCard";
 import { decisionSurfaceMockFromInput, type DecisionSurfaceKind as MockDecisionSurfaceKind } from "./lib/decisionSurfaceMock";
+
 const UndoRewindBanner = lazy(() => import("./components/UndoRewindBanner").then((module) => ({ default: module.UndoRewindBanner })));
-const WebView2ApprovalSmoke = lazy(() => import("./lib/useWebView2ApprovalSmoke").then((module) => ({ default: module.WebView2ApprovalSmoke })));
+
 /** Footer decision surface kinds. Runtime blockers are explicit recovery choices. */
 type DecisionSurfaceKind = MockDecisionSurfaceKind | "extension_form";
 import { StatusBar } from "./components/StatusBar";
@@ -103,6 +104,7 @@ import {
   type DesktopStartupSettingsView,
   type Mode,
   modeHasPlan,
+  type ProjectNode,
   type RewindResultView,
   type RemoteHostView,
   type SessionMeta,
@@ -206,14 +208,18 @@ import { composerDraftKeyForTab } from "./lib/composerDraftKey";
 import { continueDelivery } from "./lib/deliveryContinue";
 import { activateGoalAndSubmitOnTab } from "./lib/goalSubmit";
 import logoWordmark from "./assets/logo-wordmark.svg";
+
 // Hold reasoning UI until the authoritative desktop startup settings arrive;
 // this prevents a hidden preference from flashing content during first paint.
 setReasoningDisplayPending();
+
 const TERMINAL_CLOSE_TRANSITION_MS = 250;
+
 function noticePreviewMockEnabled(): boolean {
   const value = browserMockScenarioParam();
   return value === "notice" || value === "notices" || value === "notice-preview";
 }
+
 function runtimeProfileShortKey(mode: TokenMode) {
   return mode === "economy"
     ? "composer.runtimeProfileEconomyShort" as const
@@ -221,6 +227,7 @@ function runtimeProfileShortKey(mode: TokenMode) {
       ? "composer.runtimeProfileDeliveryShort" as const
       : "composer.runtimeProfileBalancedShort" as const;
 }
+
 function noticePreviewItems(): Item[] {
   const notice = (index: number, level: "info" | "warn", text: string, detail: string, code?: string): Item => ({
     kind: "notice",
@@ -882,6 +889,30 @@ function SidebarImConnectionDetail({ connection, onClose, onOpenSession, onOpenS
   );
 }
 
+function activeTopicTurnsFromTree(tree: ProjectNode[], tab?: TabMeta): number | undefined {
+  if (!tab?.topicId) return undefined;
+  const targetScope = tab.scope === "global" ? "global" : "project";
+  const walk = (nodes: ProjectNode[]): number | undefined => {
+    for (const node of nodes) {
+      if (!node) continue;
+      if (node.kind === "topic" || node.kind === "global_topic") {
+        const scope = node.kind === "global_topic" ? "global" : "project";
+        if (
+          scope === targetScope &&
+          node.topicId === tab.topicId &&
+          (scope === "global" || node.root === tab.workspaceRoot)
+        ) {
+          return node.turns;
+        }
+      }
+      const found = walk(asArray(node.children));
+      if (found !== undefined) return found;
+    }
+    return undefined;
+  };
+  return walk(tree);
+}
+
 function normalizeDesktopPlatform(value: string): DesktopPlatform {
   if (value === "darwin" || value === "windows") return value;
   return "linux";
@@ -1088,7 +1119,6 @@ export default function App() {
     purgeTrashedSession,
     renameSession,
     loadOlderHistory,
-    retrySessionHistory,
     refreshMeta,
     pickWorkspace,
     switchWorkspace,
@@ -1183,7 +1213,7 @@ export default function App() {
   const sidebarWidth = useLayoutStore((s) => s.sidebarWidth);
   const setSidebarWidth = useLayoutStore((s) => s.setSidebarWidth);
   const [sidebarResizing, setSidebarResizing] = useState(false);
-  const [tasksOpen, setTasksOpen] = useState<false | "session" | "all">(false);
+  const [tasksOpen, setTasksOpen] = useState(false);
   const [liveSidebarWidth, setLiveSidebarWidth] = useState<number | null>(null);
   const [viewportWidth, setViewportWidth] = useState(() => (typeof window === "undefined" ? 1440 : window.innerWidth));
   const [viewportHeight, setViewportHeight] = useState(() => (typeof window === "undefined" ? 720 : window.innerHeight));
@@ -1694,13 +1724,9 @@ export default function App() {
         cancelled = true;
       };
     }
-    void app.GetTopicSummary({
-      scope: activeTab.scope === "global" ? "global" : "project",
-      workspaceRoot: activeTab.scope === "global" ? "" : activeTab.workspaceRoot,
-      topicId: activeTab.topicId,
-    })
-      .then((topic) => {
-        if (!cancelled) setActiveTopicTurns(topic.turns);
+    void app.ListProjectTree()
+      .then((tree) => {
+        if (!cancelled) setActiveTopicTurns(activeTopicTurnsFromTree(asArray(tree), activeTab));
       })
       .catch(() => {
         if (!cancelled) setActiveTopicTurns(undefined);
@@ -3979,7 +4005,6 @@ export default function App() {
           setSettingsTarget("models");
         },
       },
-      { id: "cmd-task-center", group: t("palette.group.commands"), title: t("palette.cmd.taskCenter"), icon: <Activity size={15} />, compact: true, keywords: ["task", "tasks", "center", "任务", "任务中心"], run: () => setTasksOpen("all") },
       { id: "cmd-terminal", group: t("palette.group.commands"), title: t("rightDock.terminal"), icon: <TerminalSquare size={15} />, compact: true, keywords: ["terminal", "shell", "终端"], run: () => toggleTerminalPanel() },
       {
         id: "cmd-reload-runtime",
@@ -3991,7 +4016,8 @@ export default function App() {
         run: () => {
           const tabID = activeTab?.id;
           if (!tabID) return;
-          // Success/queued feedback arrives as a tab notice; only hard failures need a toast.
+          // Success/queued feedback arrives as a tab notice from the Go side;
+          // only hard failures need a toast here.
           void app.ReloadRuntime(tabID).catch((err) => showToast(err instanceof Error ? err.message : String(err), "error"));
         },
       },
@@ -4269,7 +4295,6 @@ export default function App() {
   return (
     <ShellExpandProvider>
     <UpdaterProvider>
-    {window.__REASONIX_WEBVIEW2_APPROVAL_SMOKE__ === true && <Suspense fallback={null}><WebView2ApprovalSmoke activeTabId={activeTabId} approval={state.approval} /></Suspense>}
     <ShellHotkeys />
     <TextSizeHotkeys />
       <div
@@ -4792,8 +4817,8 @@ export default function App() {
                   className={`topicbar__action-btn topicbar__action-btn--icon topicbar__action-btn--utility${tasksOpen ? " topicbar__action-btn--active" : ""}`}
                   type="button"
                   aria-label="Session summary"
-                  aria-expanded={Boolean(tasksOpen)}
-                  onClick={() => setTasksOpen((open) => open ? false : "session")}
+                  aria-expanded={tasksOpen}
+                  onClick={() => setTasksOpen((open) => !open)}
                 >
                   <Activity size={14} />
                 </button>
@@ -4802,9 +4827,9 @@ export default function App() {
                 <div className="taskmonitor-popover" role="dialog" aria-label="Session summary">
                   <Suspense fallback={null}>
                     <TaskMonitorPanel
-                      key={`${activeTab?.id || activeTabId || "none"}:${activeTab?.workspaceRoot || "global"}:${activeTab?.sessionPath || ""}:${tasksOpen}`}
+                      key={`${activeTab?.id || activeTabId || "none"}:${activeTab?.workspaceRoot || "global"}:${activeTab?.sessionPath || ""}`}
                       tabID={activeTab?.id || activeTabId || ""}
-                      initialOpen initialScope={tasksOpen || "session"}
+                      initialOpen
                       popover
                       summaryMode
                       onClose={() => setTasksOpen(false)}
@@ -4887,36 +4912,33 @@ export default function App() {
             ) : noticePreviewMockEnabled() ? (
               <NoticePreviewPanel />
             ) : (
-              <>
-                <Transcript
-                  items={displayItems}
-                  live={state.live}
-                  liveStore={liveStore}
-                  tabId={activeTabId}
-                  footerHeight={footerHeight}
-                  onPrompt={handleTranscriptPrompt}
-                  onDeliveryContinue={() => void handleDeliveryContinue()}
-                  onEditPrompt={handleEditPrompt}
-                  onRewind={handleMessageAction}
-                  checkpoints={state.checkpoints}
-                  actionPending={state.messageAction != null}
-                  rewindDisabled={Boolean(activeTab?.readOnly) || !controllerReady || hydratePlaceholderActive || rewindState != null || rewindCommitting || state.running || state.messageAction != null || state.approval != null || state.ask != null || clearContextPending}
-                  running={state.running || rewindCommitting}
-                  turnStartAt={state.turnStartAt}
-                  welcomeVariant={sidebarCreation ? "creation" : "default"}
-                  creationMode={sidebarCreation}
-                  actionHoverMenus={sidebarCreation && !hydratePlaceholderActive}
-                  rewindSignal={rewindSignal}
-                  revealSignal={transcriptRevealSignal}
-                  hydrating={transcriptHydrating}
-                  hasOlderHistory={state.historyHasOlder && !rewindState}
-                  olderHistoryCount={state.historyStartTurn}
-                  loadingOlderHistory={state.historyOlderLoading}
-                  onLoadOlderHistory={() => activeTabId && loadOlderHistory(activeTabId)}
-                  invocationMetadata={activeTabId ? invocationMetadataByTab[activeTabId] : undefined}
-                />
-                {state.hydrateError ? <div className="history-load-error" role="alert"><span>{state.hydrateError}</span><button type="button" className="btn btn--small" onClick={() => void retrySessionHistory(activeTabId)}>{t("common.retry")}</button></div> : null}
-              </>
+              <Transcript
+                items={displayItems}
+                live={state.live}
+                liveStore={liveStore}
+                tabId={activeTabId}
+                footerHeight={footerHeight}
+                onPrompt={handleTranscriptPrompt}
+                onDeliveryContinue={() => void handleDeliveryContinue()}
+                onEditPrompt={handleEditPrompt}
+                onRewind={handleMessageAction}
+                checkpoints={state.checkpoints}
+                actionPending={state.messageAction != null}
+                rewindDisabled={Boolean(activeTab?.readOnly) || !controllerReady || hydratePlaceholderActive || rewindState != null || rewindCommitting || state.running || state.messageAction != null || state.approval != null || state.ask != null || clearContextPending}
+                running={state.running || rewindCommitting}
+                turnStartAt={state.turnStartAt}
+                welcomeVariant={sidebarCreation ? "creation" : "default"}
+                creationMode={sidebarCreation}
+                actionHoverMenus={sidebarCreation && !hydratePlaceholderActive}
+                rewindSignal={rewindSignal}
+                revealSignal={transcriptRevealSignal}
+                hydrating={transcriptHydrating}
+                hasOlderHistory={state.historyHasOlder && !rewindState}
+                olderHistoryCount={state.historyStartTurn}
+                loadingOlderHistory={state.historyOlderLoading}
+                onLoadOlderHistory={() => activeTabId && loadOlderHistory(activeTabId)}
+                invocationMetadata={activeTabId ? invocationMetadataByTab[activeTabId] : undefined}
+              />
             )}
           </main>
 
@@ -5127,7 +5149,6 @@ export default function App() {
               collaborationMode={collaborationMode}
               toolApprovalMode={toolApprovalMode}
               tokenMode={tokenMode}
-              turnPhase={state.turnPhase}
               goal={goal}
               goalStatus={state.meta?.goalStatus}
               goalRuntime={state.meta?.goalRuntime}
