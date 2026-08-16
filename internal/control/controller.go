@@ -65,10 +65,6 @@ import (
 // while one is already active in the same Controller.
 var ErrTurnRunning = errors.New("turn already running")
 
-// ErrRuntimeDraining reports that a caller targeted a controller generation
-// superseded by a successful rebuild.
-var ErrRuntimeDraining = errors.New("runtime is draining after rebuild")
-
 // errTurnRunningRotation and errRotationInProgress are returned by the
 // session-rotation gate (beginRotation) when a rotation cannot proceed: a turn
 // is in flight, or another rotation already holds the gate.
@@ -170,17 +166,14 @@ type Controller struct {
 	mcpConfigureSpec      func(*plugin.Spec)
 	capabilityRuntime     *agent.MCPCapabilityRuntime
 
-	runtimeGeneration  uint64 // PublishGate gen; 0 disables
-	runtimeOwner       *extension.RuntimeOwner
-	lastResumeDecision extension.ResumeDecision
 	// extensions is the frozen extension dispatcher for this controller
-	// generation, or nil when no v2 runtime packages are installed (the
+	// generation, or nil when no v1 runtime packages are installed (the
 	// universal pre-dispatch fast path). It is installed before the controller
 	// starts serving (Options.Extensions or SetExtensions) and never swapped
 	// afterwards, so wiring points read it without locking.
 	extensions *dispatch.Dispatcher
 	// extensionUI is the host extension UI hub for this controller generation
-	// (stage 8a), or nil when no v2 runtime packages started. Installed via
+	// (stage 8a), or nil when no v1 runtime packages started. Installed via
 	// SetExtensionUI before serving and never swapped; readers take c.mu.
 	extensionUI *uihub.Hub
 	// providerResolver is the build's merged provider catalog (extension
@@ -476,10 +469,6 @@ type Options struct {
 	// by stable use_capability frontends. It shares Host processes with sibling
 	// tabs but never shares their enabled/disabled state.
 	CapabilityRuntime *agent.MCPCapabilityRuntime
-	RuntimeGeneration uint64 // PublishGate generation for admission
-	// RuntimeOwner isolates publish/drain gates and receipts to one
-	// controller/session rebuild lineage. Nil preserves compatibility behavior.
-	RuntimeOwner *extension.RuntimeOwner
 	// WorkspaceRoot is the project root checkpoint restores are confined to ("" =
 	// no confinement). Frontends pass the cwd they launched the session in.
 	WorkspaceRoot          string
@@ -521,7 +510,7 @@ type Options struct {
 	// the backward-compatible Balanced profile.
 	RuntimeProfile capability.Profile
 	// Extensions is the frozen extension dispatcher for this controller
-	// generation (Extension Protocol v2, stage 6b1). Nil means no v2 runtime
+	// generation (Extension Protocol v1, stage 6b1). Nil means no v1 runtime
 	// packages are installed: every extension wiring point takes an untouched
 	// fast path. Boot installs it through SetExtensions because sidecars (and
 	// therefore the dispatcher) only exist after snapshot assembly, which runs
@@ -529,7 +518,7 @@ type Options struct {
 	Extensions *dispatch.Dispatcher
 	// ProviderResolver is the build's merged provider catalog — extension
 	// sidecar providers folded over the config/broker base (stage 7). Nil when
-	// no v2 runtime sidecar declared providers; ProviderCatalog then returns
+	// no v1 runtime sidecar declared providers; ProviderCatalog then returns
 	// nil and frontends enumerate providers from config alone, as before.
 	ProviderResolver provider.Resolver
 	// Ablation switches subsystems off for a benchmark arm. The zero value runs
@@ -559,8 +548,6 @@ func New(opts Options) *Controller {
 	if pluginCtx == nil {
 		pluginCtx = context.Background()
 	}
-	runtimeOwner := runtimeOwnerOrDefault(opts.RuntimeOwner)
-	pluginCtx = extension.ContextWithRuntimeOwner(pluginCtx, runtimeOwner)
 	runtimeProfile := opts.RuntimeProfile
 	if runtimeProfile == "" {
 		runtimeProfile = capability.ProfileBalanced
@@ -613,8 +600,6 @@ func New(opts Options) *Controller {
 		workspaceRoot:                     opts.WorkspaceRoot,
 		externalFolderToolRefs:            opts.ExternalFolderToolRefs,
 		providerResolver:                  opts.ProviderResolver,
-		runtimeGeneration:                 opts.RuntimeGeneration,
-		runtimeOwner:                      runtimeOwner,
 		approval:                          newApprovalManager(opts.Policy, ToolApprovalAsk, opts.ApprovalTimeout),
 	}
 	// Session-private temporary directory: reuse a shared Manager on hot
@@ -675,9 +660,12 @@ func (c *Controller) SetDisplayRecorder(fn func(content, display string)) {
 
 // SetExtensions installs the extension dispatcher after construction. Boot
 // uses it because sidecars — and therefore the dispatcher — only exist after
-// snapshot assembly, which runs after New. First non-nil install wins for the
-// cold-start path; use ReplaceExtensions for generation-safe rebuild swaps.
-// Nil is a no-op. The executor agent receives the same dispatcher (stage 6b2).
+// snapshot assembly, which runs after New. It must be called before the
+// controller starts serving turns: c.sink is swapped here and emission call
+// sites read it without locking. The first non-nil install wins; a controller
+// generation never swaps dispatchers. Nil is a no-op (the pre-dispatch path).
+// The executor agent receives the same dispatcher so the run loop consults
+// the agent-side intercept points (stage 6b2).
 func (c *Controller) SetExtensions(d *dispatch.Dispatcher) {
 	if d == nil {
 		return
@@ -687,41 +675,11 @@ func (c *Controller) SetExtensions(d *dispatch.Dispatcher) {
 	if c.extensions != nil {
 		return
 	}
-	c.installExtensionsLocked(d)
-}
-
-// ReplaceExtensions atomically swaps the dispatcher for a reused controller
-// after a narrow rebuild. Updates sink strategy owner and executor together.
-func (c *Controller) ReplaceExtensions(d *dispatch.Dispatcher) {
-	if c == nil || d == nil {
-		return
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.installExtensionsLocked(d)
-}
-
-func (c *Controller) installExtensionsLocked(d *dispatch.Dispatcher) {
 	c.extensions = d
-	if existing, ok := c.sink.(*frontendEventSink); ok {
-		existing.setDispatcher(d)
-	} else {
-		c.sink = newFrontendEventSink(c.sink, d)
-	}
+	c.sink = newFrontendEventSink(c.sink, d)
 	if c.executor != nil {
 		c.executor.SetExtensions(d)
 	}
-}
-
-// SetProviderResolver replaces the session's merged provider catalog (narrow
-// rebuild after sidecar Manager roll). Nil clears extension-hosted providers.
-func (c *Controller) SetProviderResolver(r provider.Resolver) {
-	if c == nil {
-		return
-	}
-	c.mu.Lock()
-	c.providerResolver = r
-	c.mu.Unlock()
 }
 
 // ApplyExtensionSystemPrompt swaps the executor to a fresh session carrying
@@ -792,16 +750,10 @@ func (c *Controller) ToolContractEntries() []tool.ContractEntry {
 // namespace. Nil when no sidecar declared providers, so frontends can tell
 // "enumerate config only" apart from "the extension catalog is empty".
 func (c *Controller) ProviderCatalog() []provider.Descriptor {
-	if c == nil {
+	if c == nil || c.providerResolver == nil {
 		return nil
 	}
-	c.mu.Lock()
-	r := c.providerResolver
-	c.mu.Unlock()
-	if r == nil {
-		return nil
-	}
-	return r.Catalog()
+	return c.providerResolver.Catalog()
 }
 
 func (c *Controller) recordDisplayForNewUser(startMessages int, display string) {
@@ -867,36 +819,98 @@ func (c *Controller) rebindCheckpoints(sessionPath string) {
 	}
 }
 
-// beginCheckpoint opens a checkpoint for the turn about to run, recording the
-// current message count as the conversation-rewind boundary. Called at the top of
-// runTurn, before the user message is appended.
-func (c *Controller) beginCheckpoint(input string) {
-	if c.executor == nil {
-		return
-	}
-	atomic.AddInt64(&c.sessionRevision, 1)
-	c.checkpoints.beginWithObserver(input, len(c.executor.Session().Messages), c.mutationObserver)
-	// User-visible turn start records an irreversible message-send receipt so
-	// recovery never claims a clean rollback of already-committed prompts.
-	gen := c.RuntimeGeneration()
-	if gen == 0 {
-		gen = c.RuntimeOwner().Gate.Published()
-	}
-	msgID := fmt.Sprintf("turn-%d-%d", gen, atomic.LoadInt64(&c.sessionRevision))
-	// Dedup: a retried turn with the same revision must not double-record.
-	owner := c.RuntimeOwner()
-	owner.RecordMessageSentOnce(gen, msgID, "control")
-	d := owner.DecideResume(gen)
-	c.mu.Lock()
-	c.lastResumeDecision = d
-	c.mu.Unlock()
+// commands (frontend → controller)
+
+// admissionResult classifies what runGuarded did with a turn body.
+type admissionResult int
+
+const (
+	// turnStarted: admission was open; the turn is running now.
+	turnStarted admissionResult = iota
+	// turnParked: the body landed inside the finishing window (TurnDone was
+	// being delivered) and will start the moment the window closes. From the
+	// caller's perspective the turn WILL run — nothing was lost.
+	turnParked
+	// turnDroppedRunning: a turn is genuinely in flight. Deliberately silent,
+	// as before: interactive frontends prevent this with their own
+	// steer/queue UX, and internal opportunistic callers (goal-loop
+	// continuations, replays) rely on a quiet no-op.
+	turnDroppedRunning
+	// turnDroppedRotating: the executor session is being swapped out
+	// (NewSession/ClearSession). The input's intended session is ambiguous,
+	// so it is refused with a user-visible Notice asking to resend rather
+	// than silently running against a session the user didn't see.
+	turnDroppedRotating
+	// turnDroppedClosed: the controller has been closed. Deliberately silent:
+	// this controller's transports are being (or have been) torn down and the
+	// input's home is the replacement controller the host swaps in — a Notice
+	// here would go to a dead surface.
+	turnDroppedClosed
+)
+
+// runGuarded runs body on a background goroutine under a fresh cancellable
+// context, guarding against concurrent turns and emitting a TurnDone event when
+// it finishes (Err set on failure; nil also for a user Cancel).
+//
+// Admission is NOT first-come-first-served across all states — see
+// admissionResult. In particular, a body arriving during the finishing window
+// is parked, not dropped: TurnDone is emitted inside that window, so every
+// caller that reacts to TurnDone by submitting again (a frontend's queued
+// auto-send, a bot, a fast Enter) would otherwise race a silent drop. That
+// exact loss was observed in CI and reproduced on a clean main-v2 worktree,
+// and the desktop composer already carries a workaround gating its auto-send
+// on submitDisabled rather than turn_done (Composer.tsx).
+func (c *Controller) runGuarded(body func(ctx context.Context) error) admissionResult {
+	return c.admitGuardedTurn(body, false)
 }
 
-// commands (frontend → controller)
+// runGuardedOrPark admits like runGuarded but parks the body while another
+// turn is running instead of using the deliberately-silent running drop.
+// Reserved for inputs that are the user's own words (the steer fallback):
+// the FIFO drain in finishGuardedTurn delivers them the moment the current
+// turn finishes.
+func (c *Controller) runGuardedOrPark(body func(ctx context.Context) error) admissionResult {
+	return c.admitGuardedTurn(body, true)
+}
+
+func (c *Controller) admitGuardedTurn(body func(ctx context.Context) error, parkWhileRunning bool) admissionResult {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return turnDroppedClosed
+	}
+	if c.rotating {
+		c.mu.Unlock()
+		c.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelWarn, Text: "input was not accepted: the session is being switched — please resend"})
+		return turnDroppedRotating
+	}
+	if c.running {
+		if parkWhileRunning {
+			c.parkedTurns = append(c.parkedTurns, body)
+			c.mu.Unlock()
+			return turnParked
+		}
+		c.mu.Unlock()
+		return turnDroppedRunning
+	}
+	if c.finishing {
+		c.parkedTurns = append(c.parkedTurns, body)
+		c.mu.Unlock()
+		return turnParked
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	c.cancel = cancel
+	c.running = true
+	c.canceling = false
+	c.mu.Unlock()
+	c.spawnGuardedTurn(ctx, cancel, body)
+	return turnStarted
+}
 
 // spawnGuardedTurn launches an admitted turn body plus its autosave companion.
 // The caller must already have claimed admission (running=true) under c.mu.
 func (c *Controller) spawnGuardedTurn(ctx context.Context, cancel context.CancelFunc, body func(ctx context.Context) error) {
+	ctx, completion := withGuardedTurnCompletion(ctx)
 	c.autosaveWG.Go(func() {
 		c.autosaveWhileRunning(ctx)
 	})
@@ -904,11 +918,11 @@ func (c *Controller) spawnGuardedTurn(ctx context.Context, cancel context.Cancel
 		defer cancel()
 		defer func() {
 			if r := recover(); r != nil {
-				c.finishGuardedTurn(fmt.Errorf("internal error: %v", r))
+				c.finishGuardedTurn(fmt.Errorf("internal error: %v", r), completion)
 			}
 		}()
 		err := body(ctx)
-		c.finishGuardedTurn(explainError(err))
+		c.finishGuardedTurn(explainError(err), completion)
 	}()
 }
 
@@ -924,7 +938,7 @@ func (c *Controller) spawnGuardedTurn(ctx context.Context, cancel context.Cancel
 // finishGuardedTurn, preserving FIFO order. Rotation cannot interleave here:
 // beginRotation refuses while running or finishing, and the drain flips
 // finishing directly into running.
-func (c *Controller) finishGuardedTurn(err error) {
+func (c *Controller) finishGuardedTurn(err error, completion *guardedTurnCompletion) {
 	c.memory.clearAutoRemember()
 	c.mu.Lock()
 	cancelRequested := c.canceling
@@ -949,14 +963,14 @@ func (c *Controller) finishGuardedTurn(err error) {
 		}
 		next := c.parkedTurns[0]
 		c.parkedTurns = c.parkedTurns[1:]
-		ctx, cancel := context.WithCancel(extension.ContextWithRuntimeOwner(context.Background(), c.runtimeOwner))
+		ctx, cancel := context.WithCancel(context.Background())
 		c.cancel = cancel
 		c.running = true
 		c.canceling = false
 		c.mu.Unlock()
 		c.spawnGuardedTurn(ctx, cancel, next)
 	}()
-	done := event.Event{Kind: event.TurnDone, Err: err, Cancelled: cancelRequested, Outcome: turnOutcome(err)}
+	done := event.Event{Kind: event.TurnDone, Err: err, Cancelled: cancelRequested, Outcome: turnOutcome(err), CheckpointTurn: c.validatedCheckpointTurn(completion)}
 	var readinessErr *agent.FinalReadinessError
 	if errors.As(err, &readinessErr) {
 		done.Readiness = &event.FinalReadiness{Attempts: readinessErr.Attempts, Missing: append([]string(nil), readinessErr.Missing...)}
@@ -1037,7 +1051,7 @@ func (c *Controller) runTurn(ctx context.Context, input string) error {
 // composition, checkpoints, hooks, and plan approval. It is for transports that
 // need a blocking request/response boundary, such as ACP session/prompt.
 func (c *Controller) RunTurn(ctx context.Context, input string) error {
-	ctx, cancel := context.WithCancel(extension.ContextWithRuntimeOwner(ctx, c.RuntimeOwner()))
+	ctx, cancel := context.WithCancel(ctx)
 	c.mu.Lock()
 	// finishing is part of the gate: TurnDone delivery for the previous turn
 	// is still fanning out, and starting a synchronous turn inside that
@@ -1049,12 +1063,6 @@ func (c *Controller) RunTurn(ctx context.Context, input string) error {
 		c.mu.Unlock()
 		cancel()
 		return ErrTurnRunning
-	}
-	if c.rejectDrainingGenerationLocked() {
-		c.mu.Unlock()
-		cancel()
-		c.emitDrainingNotice()
-		return ErrRuntimeDraining
 	}
 	c.cancel = cancel
 	c.running = true
@@ -1908,11 +1916,6 @@ func (c *Controller) noticeDetail(text, detail string) {
 // headless `reasonix run` path, where the Sink renders to stdout and the caller
 // just needs the exit status — no TurnDone event, no cancel bookkeeping.
 func (c *Controller) Run(ctx context.Context, input string) (err error) {
-	ctx = extension.ContextWithRuntimeOwner(ctx, c.RuntimeOwner())
-	if c.RuntimePhase() == RuntimePhaseDraining {
-		c.emitDrainingNotice()
-		return ErrRuntimeDraining
-	}
 	defer event.RecordTurnCompletion(c.sink)
 	c.maybeSessionStart(ctx)
 	parentSession := c.parentSessionID()
@@ -1934,7 +1937,7 @@ func (c *Controller) Run(ctx context.Context, input string) (err error) {
 	}
 	startMessages := c.messageCount()
 	defer c.snapshotActivityIfChanged(startMessages)
-	c.beginCheckpoint(input)
+	c.beginCheckpoint(ctx, input)
 	if c.guardianSess != nil {
 		c.guardianSess.ResetTurn()
 	}
